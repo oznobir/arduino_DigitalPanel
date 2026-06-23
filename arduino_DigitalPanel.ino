@@ -1,3 +1,9 @@
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#define ONE_WIRE_BUS 14 // Датчики сидят на цифровом пине 14
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
 // Настройка пинов 
 const int CAN_CS_PIN = 53;     // Пин CS для MCP2515
 const int CAN_INT_PIN = 2;     // Пин прерывания INT для MCP2515
@@ -8,7 +14,8 @@ MCP_CAN CAN0(CAN_CS_PIN);     // Инициализация объекта CAN
 
 void setup() {
   // put your setup code here, to run once:
-Serial.begin(115200);
+  Serial.begin(115200);
+  sensors.begin();
 
   // Настройка пинов для оптопар PC817 (обязательно PULLUP)
   pinMode(HANDBRAKE_PIN, INPUT_PULLUP);
@@ -56,8 +63,18 @@ void loop() {
       Serial.print(rxBuf[i], HEX);
       Serial.print(" ");
     }
-    Serial.println();
+  Serial.println();
   }
-  
+  //3. Запрос температуры у всех датчиков DS18B20 на шине
+  sensors.requestTemperatures();
+  // Считываем по индексам (индекс зависит от того, какой датчик плата найдет первым)
+  Serial.print("Temp.1: ");
+  Serial.println((char)sensors.getTempCByIndex(0)); 
+  Serial.print("Temp.2: ");
+  Serial.println((char)sensors.getTempCByIndex(1)); 
+  Serial.print("Temp.3: ");
+  Serial.println((char)sensors.getTempCByIndex(2)); 
+
+  Serial.println(); 
   delay(50); // Небольшая задержка для стабильности цикла
 }
