@@ -1,0 +1,46 @@
+# Временные файлы компиляции
+/build/
+/cache/
+
+# Временные файлы сборки Arduino
+applet/
+build/
+build-*.tmp/
+
+# Локальные файлы конфигурации редакторов
+.build/
+.settings/
+.vscode/
+.idea/
+
+# Файлы систем PlatformIO, CMake
+.pio/
+.pioenvs/
+.piolibdeps/
+CMakeLists.txt
+CMakePresets.json
+
+# Логи и отчеты
+*.log
+*.tmp
+*.map
+*.lst
+
+# Файлы операционных систем
+.DS_Store
+Thumbs.db
+
+
+
+# Файлы компиляции
+*.elf
+*.hex
+*.bin
+*.o
+*.a
+*.d
+
+# Настройки для некоторых версий платформ
+.atmelstart/
+firmware.elf
+
