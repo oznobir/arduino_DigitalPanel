@@ -1,20 +1,30 @@
+#include <SPI.h>
+#include <mcp_can.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
+
 #define ONE_WIRE_BUS 14 // Датчики сидят на цифровом пине 14
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 
 // Настройка пинов 
-const int CAN_CS_PIN = 53;     // Пин CS для MCP2515
+const int CAN_CS_PIN = 53;     // Пин CS для MCP2515 (на Arduino Mega)
 const int CAN_INT_PIN = 2;     // Пин прерывания INT для MCP2515
-const int HANDBRAKE_PIN = 16;   // Пример подключения ручника (датчик по минусу)
-const int TURN_LEFT_PIN = 17;   // Пример подключения поворотника (датчик по плюсу)
-MCP_CAN CAN0(CAN_CS_PIN);     // Инициализация объекта CAN
+const int HANDBRAKE_PIN = 16;   // Подключение ручника (через оптопару)
+const int TURN_LEFT_PIN = 17;   // Подключение поворотника (через оптопару)
 
+MCP_CAN CAN0(CAN_CS_PIN);       // Инициализация объекта CAN
+
+// Переменные таймера для опроса температуры (чтобы не тормозить CAN-шину)
+unsigned long lastTempRequest = 0;
+const unsigned long tempInterval = 3000; // Опрос температуры раз в 3 секунды
+
+// Переменные для отслеживания изменения состояния входов (защита от спама в порт)
+bool lastHandbrakeState = HIGH;
+bool lastTurnLeftState = HIGH;
 
 void setup() {
-  // put your setup code here, to run once:
-  Serial.begin(115200);
+  Serial.begin(115200); // Скорость Монитора порта — 115200
   sensors.begin();
 
   // Настройка пинов для оптопар PC817 (обязательно PULLUP)
@@ -32,21 +42,31 @@ void setup() {
   
   CAN0.setMode(MCP_NORMAL);   // Переводим CAN в рабочий режим
   pinMode(CAN_INT_PIN, INPUT); 
-
 }
 
 void loop() {
-  // put your main code here, to run repeatedly:
-  // 1. Опрос датчиков с оптопары PC817
-  if (digitalRead(HANDBRAKE_PIN) == LOW) {
-    // Оптопара открылась, значит датчик в авто выдал активный сигнал
-    Serial.println("Ручник затянут!");
+  // --- 1. ОПРОС ДАТЧИКОВ С ОПТОПАРЫ PC817 (Вывод только при изменении) ---
+  bool currentHandbrakeState = digitalRead(HANDBRAKE_PIN);
+  if (currentHandbrakeState != lastHandbrakeState) {
+    if (currentHandbrakeState == LOW) {
+      Serial.println(">>> Ручник затянут!");
+    } else {
+      Serial.println(">>> Ручник отпущен.");
+    }
+    lastHandbrakeState = currentHandbrakeState;
   }
-  if (digitalRead(TURN_LEFT_PIN) == LOW) {
-    // Оптопара открылась, значит датчик в авто выдал активный сигнал
-    Serial.println("Левый поворотник включен!");
+
+  bool currentTurnLeftState = digitalRead(TURN_LEFT_PIN);
+  if (currentTurnLeftState != lastTurnLeftState) {
+    if (currentTurnLeftState == LOW) {
+      Serial.println(">>> Левый поворотник включен!");
+    } else {
+      Serial.println(">>> Левый поворотник выключен.");
+    }
+    lastTurnLeftState = currentTurnLeftState;
   }
-  // 2. Чтение данных из CAN-шины автомобиля
+
+  // --- 2. ЧТЕНИЕ ДАННЫХ ИЗ CAN-ШИНЫ АВТОМОБИЛЯ (Мгновенно) ---
   if(!digitalRead(CAN_INT_PIN)) { // Если пришел пакет (пин INT упал в LOW)
     long unsigned int rxId;
     unsigned char len = 0;
@@ -55,26 +75,30 @@ void loop() {
     CAN0.readMsgBuf(&rxId, &len, rxBuf); // Читаем данные из буфера
     
     // Выводим ID пакета и данные в Serial для анализа
-    Serial.print("ID: 0x");
+    Serial.print("CAN ID: 0x");
     Serial.print(rxId, HEX);
     Serial.print(" Data: ");
-    for(int i = 0; i<len; i++) {
-      if(rxBuf[i] < 0x10) Serial.print("0");
+    for(int i = 0; i < len; i++) {
+      if(rxBuf[i] < 0x10) Serial.print("0"); // Красивый вывод с ведущим нулем
       Serial.print(rxBuf[i], HEX);
       Serial.print(" ");
     }
-  Serial.println();
+    Serial.println();
   }
-  //3. Запрос температуры у всех датчиков DS18B20 на шине
-  sensors.requestTemperatures();
-  // Считываем по индексам (индекс зависит от того, какой датчик плата найдет первым)
-  Serial.print("Temp.1: ");
-  Serial.println((char)sensors.getTempCByIndex(0)); 
-  Serial.print("Temp.2: ");
-  Serial.println((char)sensors.getTempCByIndex(1)); 
-  Serial.print("Temp.3: ");
-  Serial.println((char)sensors.getTempCByIndex(2)); 
 
-  Serial.println(); 
-  delay(50); // Небольшая задержка для стабильности цикла
+  // --- 3. ЗАПРОС ТЕМПЕРАТУРЫ DS18B20 ПО ТАЙМЕРУ (Без delay) ---
+  if (millis() - lastTempRequest >= tempInterval) {
+    lastTempRequest = millis(); // Сброс таймера
+    
+    sensors.requestTemperatures(); // Запрос у всех датчиков
+    
+    // Считываем по индексам. Вывод в формате float (убрали char)
+    Serial.print("  [TEMP] T1: ");
+    Serial.print(sensors.getTempCByIndex(0));
+    Serial.print(" °C | T2: ");
+    Serial.print(sensors.getTempCByIndex(1));
+    Serial.print(" °C | T3: ");
+    Serial.print(sensors.getTempCByIndex(2));
+    Serial.println(" °C");
+  }
 }
