@@ -12,6 +12,7 @@ const int CAN_CS_PIN = 53;     // Пин CS для MCP2515 (на Arduino Mega)
 const int CAN_INT_PIN = 2;     // Пин прерывания INT для MCP2515
 const int HANDBRAKE_PIN = 16;   // Подключение ручника (через оптопару)
 const int TURN_LEFT_PIN = 17;   // Подключение поворотника (через оптопару)
+const int FUEL_PIN = A0;       // Пин ДУТ с фильтром и защитой
 
 MCP_CAN CAN0(CAN_CS_PIN);       // Инициализация объекта CAN
 
@@ -86,13 +87,26 @@ void loop() {
     Serial.println();
   }
 
-  // --- 3. ЗАПРОС ТЕМПЕРАТУРЫ DS18B20 ПО ТАЙМЕРУ (Без delay) ---
+  // --- 3. ЗАПРОС ТЕМПЕРАТУРЫ DS18B20 ПО ТАЙМЕРУ ---
   if (millis() - lastTempRequest >= tempInterval) {
     lastTempRequest = millis(); // Сброс таймера
+
+    // Чтение датчика уровня топлива
+    int rawFuel = analogRead(FUEL_PIN); // Считываем АЦП (получим от 0 до ~769)
+  
+    // Калибровка под потенциометр B1k и резистор 330 Ом
+    // R1 (330 Ом) и R2 (1000 Ом). Всего 1330 Ом. 
+    // 5в*(1000 Ом/1330 Ом) = 3,76в
+    // 3,76в/5в*1023 = 769 АЦП
+    // 0 Ом (пустой бак) = 0 АЦП. 1000 Ом (полный бак) = 769 АЦП.
+    int fuelPercent = map(rawFuel, 0, 769, 0, 100); 
+  
+    // Защита от выхода за границы 0-100% (если потенциометр выдаст чуть больше 769)
+    fuelPercent = constrain(fuelPercent, 0, 100); 
     
     sensors.requestTemperatures(); // Запрос у всех датчиков
     
-    // Считываем по индексам. Вывод в формате float (убрали char)
+    // Считываем по индексам. Вывод в формате float
     Serial.print("  [TEMP] T1: ");
     Serial.print(sensors.getTempCByIndex(0));
     Serial.print(" °C | T2: ");
@@ -100,5 +114,13 @@ void loop() {
     Serial.print(" °C | T3: ");
     Serial.print(sensors.getTempCByIndex(2));
     Serial.println(" °C");
+
+    // Вывод уровня топлива в Монитор порта
+    Serial.print("  [FUEL] Значение АЦП: ");
+    Serial.print(rawFuel);
+    Serial.print(" из 769 | Уровень в баке: ");
+    Serial.print(fuelPercent);
+    Serial.println(" %");
+    Serial.println();
   }
 }
