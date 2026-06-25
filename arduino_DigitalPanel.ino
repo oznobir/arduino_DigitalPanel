@@ -47,24 +47,41 @@ void setup() {
 
 void loop() {
   // --- 1. ОПРОС ДАТЧИКОВ С ОПТОПАРЫ PC817 (Вывод только при изменении) ---
-  bool currentHandbrakeState = digitalRead(HANDBRAKE_PIN);
-  if (currentHandbrakeState != lastHandbrakeState) {
-    if (currentHandbrakeState == LOW) {
-      Serial.println(">>> Ручник затянут!");
-    } else {
-      Serial.println(">>> Ручник отпущен.");
+  static unsigned long lastDebounceTimeHandbrake = 0;
+  static unsigned long lastDebounceTimeTurn = 0;
+  const unsigned long debounceDelay = 50; // Время фильтрации дребезга (50 мс)
+
+  // Проверка РУЧНИКА
+  bool readingHandbrake = digitalRead(HANDBRAKE_PIN);
+  if (readingHandbrake != lastHandbrakeState) {
+    // Если состояние изменилось, запускаем/сбрасываем таймер
+    if (millis() - lastDebounceTimeHandbrake > debounceDelay) {
+      if (readingHandbrake == LOW) {
+       Serial.println(">>> Ручник затянут!");
+      } else {
+       Serial.println(">>> Ручник отпущен.");
+      }
+      lastHandbrakeState = readingHandbrake;
+      lastDebounceTimeHandbrake = millis();
     }
-    lastHandbrakeState = currentHandbrakeState;
+  } else {
+    lastDebounceTimeHandbrake = millis(); // Сброс таймера, если состояние стабильно
   }
 
-  bool currentTurnLeftState = digitalRead(TURN_LEFT_PIN);
-  if (currentTurnLeftState != lastTurnLeftState) {
-    if (currentTurnLeftState == LOW) {
-      Serial.println(">>> Левый поворотник включен!");
-    } else {
-      Serial.println(">>> Левый поворотник выключен.");
+  // Проверка ПОВОРОТНИКА
+  bool readingTurnLeft = digitalRead(TURN_LEFT_PIN);
+  if (readingTurnLeft != lastTurnLeftState) {
+   if (millis() - lastDebounceTimeTurn > debounceDelay) {
+      if (readingTurnLeft == LOW) {
+        Serial.println(">>> Левый поворотник включен!");
+      } else {
+        Serial.println(">>> Левый поворотник выключен.");
+     }
+     lastTurnLeftState = readingTurnLeft;
+     lastDebounceTimeTurn = millis();
     }
-    lastTurnLeftState = currentTurnLeftState;
+  } else {
+    lastDebounceTimeTurn = millis();
   }
 
   // --- 2. ЧТЕНИЕ ДАННЫХ ИЗ CAN-ШИНЫ АВТОМОБИЛЯ (Мгновенно) ---
