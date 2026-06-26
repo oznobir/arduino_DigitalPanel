@@ -30,7 +30,10 @@ void setup() {
 // ------------------------------------------
 // Поиск ID датчиков температуры
 // выполняется разово
-
+//Датчик под Индексом [0] имеет ID: { 0x28, 0x79, 0xF4, 0xC8, 0x00, 0x00, 0x00, 0x8C }
+//Датчик под Индексом [1] имеет ID: { 0x28, 0xC5, 0xD7, 0xC9, 0x00, 0x00, 0x00, 0xCF }
+//Третий датчик неработает (может бракованный или плохо обжаты контакты)
+/*
   int count = sensors.getDeviceCount();
   Serial.println("--- СКАНИРОВАНИЕ ШИНЫ ONE-WIRE ---");
   Serial.print("Найдено рабочих датчиков: ");
@@ -58,7 +61,7 @@ void setup() {
 // Поиск ID датчиков температуры
 // выполняется разово
 // ------------------------------------------
-/*
+*/
 
   // Настройка пинов для оптопар PC817 (обязательно PULLUP)
   pinMode(HANDBRAKE_PIN, INPUT_PULLUP);
@@ -76,12 +79,9 @@ void setup() {
   CAN0.setMode(MCP_NORMAL);   // Переводим CAN в рабочий режим
   pinMode(CAN_INT_PIN, INPUT); 
 
-  */
 }
 
 void loop() {
-
-  /*
   // --- 1. ОПРОС ДАТЧИКОВ С ОПТОПАРЫ PC817 (Вывод только при изменении) ---
   static unsigned long lastDebounceTimeHandbrake = 0;
   static unsigned long lastDebounceTimeTurn = 0;
@@ -176,6 +176,4 @@ void loop() {
     Serial.println(" %");
     Serial.println();
   }
-
-  */
 }
