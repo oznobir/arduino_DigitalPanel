@@ -9,6 +9,7 @@
 
 // Настройка пинов 
 const int CAN_CS_PIN = 53;     // Пин CS для MCP2515 (на Arduino Mega)
+const int CAN_INT_PIN = 2;     // Пин прерывания INT для MCP2515
 MCP_CAN CAN0(CAN_CS_PIN);       // Инициализация объекта CAN
 
 // Настройка интервала опроса ГБО
@@ -19,7 +20,7 @@ void setup() {
   Serial.begin(115200); // Скорость Монитора порта — 115200
   while(!Serial); // Ожидание открытия Монитора порта
 
-  Serial.println("=== ТЕСТ CAN-МОДУЛЯ MCP2515 В РЕЖИМЕ LOOPBACK ===");
+ // Serial.println("=== ТЕСТ CAN-МОДУЛЯ MCP2515 В РЕЖИМЕ LOOPBACK ===");
 
   // Инициализируем Serial1 для связи с ГБО на штатной скорости 57600
   Serial1.begin(57600); 
@@ -28,30 +29,31 @@ void setup() {
   // Инициализация MCP2515. На Almera G15 скорость шины обычно 500 Кбит/с.
   // Кварц на плате MCP2515 стоит на 8 МГц.
   if(CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) == CAN_OK) {
-    Serial.println("MCP2515 успешно запущен!");
+    Serial.println("=== MCP2515 успешно запущен! ===");
   } else {
-    Serial.println("Ошибка инициализации MCP2515...");
+    Serial.println("=== Ошибка инициализации MCP2515... ===");
     while(1); // Останавливаем выполнение при ошибке
   }
-  /*
+  
   CAN0.setMode(MCP_NORMAL);   // Переводим CAN в рабочий режим
   pinMode(CAN_INT_PIN, INPUT); 
 
   Serial.println("=== СИСТЕМА ЗАПУЩЕНА И НАДЕЖНО ЗАПИТАНА ПО VIN ===");
-  */
+  
   // Переводим модуль в режим LOOPBACK (Сам отправил — сам принял)
-  if (CAN0.setMode(MCP_LOOPBACK) == CAN_OK) {
+  
+  /*if (CAN0.setMode(MCP_LOOPBACK) == CAN_OK) {
     Serial.println(">>> Режим Loopback успешно включен. Начинаем тест...");
   } else {
     Serial.println("!!! Не удалось переключить модуль в режим Loopback.");
   }
-
+  */
 }
-unsigned long lastTxTime = 0; 
-byte testData[8] = {0xAA, 0xBB, 0xCC, 0x11, 0x22, 0x33, 0x44, 0x55}; // Тестовые байты
+//unsigned long lastTxTime = 0; 
+//byte testData[8] = {0xAA, 0xBB, 0xCC, 0x11, 0x22, 0x33, 0x44, 0x55}; // Тестовые байты
 
 void loop() {
-  
+ /* 
   // 1. ОТПРАВКА КАН-ПАКЕТА (Раз в 2 секунды)
   if (millis() - lastTxTime >= 2000) {
     lastTxTime = millis();
@@ -96,7 +98,8 @@ void loop() {
     }
     Serial.println();
   }
-/*
+  */
+
   if(!digitalRead(CAN_INT_PIN)) { // Если пришел пакет (пин INT упал в LOW)
     long unsigned int rxId;
     unsigned char len = 0;
@@ -115,7 +118,7 @@ void loop() {
     }
     Serial.println();
   }
-*/
+
 // --- ТАЙМЕР ОПРОСА ГБО ---
   if (millis() - lastGboRequest >= gboInterval) {
     lastGboRequest = millis();
