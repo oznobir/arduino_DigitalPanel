@@ -7,6 +7,10 @@
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 
+// Жестко прописываем уникальные ID адреса датчиков
+DeviceAddress interTempSensor = { 0x28, 0x79, 0xF4, 0xC8, 0x00, 0x00, 0x00, 0x8C };
+DeviceAddress outerTempSensor = { 0x28, 0xC5, 0xD7, 0xC9, 0x00, 0x00, 0x00, 0xCF };
+
 // Настройка пинов 
 const int CAN_CS_PIN = 53;     // Пин CS для MCP2515 (на Arduino Mega)
 const int CAN_INT_PIN = 2;     // Пин прерывания INT для MCP2515
@@ -27,41 +31,6 @@ bool lastTurnLeftState = HIGH;
 void setup() {
   Serial.begin(115200); // Скорость Монитора порта — 115200
   sensors.begin();
-// ------------------------------------------
-// Поиск ID датчиков температуры
-// выполняется разово
-//Датчик под Индексом [0] имеет ID: { 0x28, 0x79, 0xF4, 0xC8, 0x00, 0x00, 0x00, 0x8C }
-//Датчик под Индексом [1] имеет ID: { 0x28, 0xC5, 0xD7, 0xC9, 0x00, 0x00, 0x00, 0xCF }
-//Третий датчик неработает (может бракованный или плохо обжаты контакты)
-/*
-  int count = sensors.getDeviceCount();
-  Serial.println("--- СКАНИРОВАНИЕ ШИНЫ ONE-WIRE ---");
-  Serial.print("Найдено рабочих датчиков: ");
-  Serial.println(count);
-  Serial.println("----------------------------------");
-  
-  for (int i = 0; i < count; i++) {
-    DeviceAddress address;
-    if (sensors.getAddress(address, i)) {
-      Serial.print("Датчик под Индексом [");
-      Serial.print(i);
-      Serial.print("] имеет ID: { ");
-      for (uint8_t j = 0; j < 8; j++) {
-        Serial.print("0x");
-        if (address[j] < 16) Serial.print("0"); // Добавляем ноль для красоты
-        Serial.print(address[j], HEX);
-        if (j < 7) Serial.print(", ");
-      }
-      Serial.println(" }");
-    }
-  }
-  Serial.println("----------------------------------");
-  Serial.println("Сканирование завершено. Можете скопировать адреса.");
-
-// Поиск ID датчиков температуры
-// выполняется разово
-// ------------------------------------------
-*/
 
   // Настройка пинов для оптопар PC817 (обязательно PULLUP)
   pinMode(HANDBRAKE_PIN, INPUT_PULLUP);
@@ -79,6 +48,8 @@ void setup() {
   CAN0.setMode(MCP_NORMAL);   // Переводим CAN в рабочий режим
   pinMode(CAN_INT_PIN, INPUT); 
 
+  Serial.println("=== СИСТЕМА ЗАПУЩЕНА И НАДЕЖНО ЗАПИТАНА ПО VIN ===");
+
 }
 
 void loop() {
@@ -93,9 +64,9 @@ void loop() {
     // Если состояние изменилось, запускаем/сбрасываем таймер
     if (millis() - lastDebounceTimeHandbrake > debounceDelay) {
       if (readingHandbrake == LOW) {
-       Serial.println(">>> Ручник затянут!");
+       Serial.println("  [Сигнал]>>> Ручник затянут!");
       } else {
-       Serial.println(">>> Ручник отпущен.");
+       Serial.println("  [Сигнал]>>> Ручник отпущен.");
       }
       lastHandbrakeState = readingHandbrake;
       lastDebounceTimeHandbrake = millis();
@@ -109,9 +80,9 @@ void loop() {
   if (readingTurnLeft != lastTurnLeftState) {
    if (millis() - lastDebounceTimeTurn > debounceDelay) {
       if (readingTurnLeft == LOW) {
-        Serial.println(">>> Левый поворотник включен!");
+        Serial.println("  [Сигнал]>>> Левый поворотник включен!");
       } else {
-        Serial.println(">>> Левый поворотник выключен.");
+        Serial.println("  [Сигнал]>>> Левый поворотник выключен.");
      }
      lastTurnLeftState = readingTurnLeft;
      lastDebounceTimeTurn = millis();
@@ -158,14 +129,16 @@ void loop() {
     fuelPercent = constrain(fuelPercent, 0, 100); 
     
     sensors.requestTemperatures(); // Запрос у всех датчиков
-    
-    // Считываем по индексам. Вывод в формате float
-    Serial.print("  [TEMP] T1: ");
-    Serial.print(sensors.getTempCByIndex(0));
-    Serial.print(" °C | T2: ");
-    Serial.print(sensors.getTempCByIndex(1));
-    Serial.print(" °C | T3: ");
-    Serial.print(sensors.getTempCByIndex(2));
+
+    // Чтение строго по ID адресам
+    float tInter = sensors.getTempC(interTempSensor);
+    float tOuter = sensors.getTempC(outerTempSensor);
+
+    // Вывод температур в Монитор порта
+    Serial.print("  [TEMP] Салон: ");
+    if (tInter == DEVICE_DISCONNECTED_C) Serial.print("ОШИБКА (-127)"); else Serial.print(tInter, 1);
+    Serial.print(" °C | Улица: ");
+    if (tOuter == DEVICE_DISCONNECTED_C) Serial.print("ОШИБКА (-127)"); else Serial.print(tOuter, 1);
     Serial.println(" °C");
 
     // Вывод уровня топлива в Монитор порта
