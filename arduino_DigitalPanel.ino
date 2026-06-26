@@ -27,6 +27,38 @@ bool lastTurnLeftState = HIGH;
 void setup() {
   Serial.begin(115200); // Скорость Монитора порта — 115200
   sensors.begin();
+// ------------------------------------------
+// Поиск ID датчиков температуры
+// выполняется разово
+
+  int count = sensors.getDeviceCount();
+  Serial.println("--- СКАНИРОВАНИЕ ШИНЫ ONE-WIRE ---");
+  Serial.print("Найдено рабочих датчиков: ");
+  Serial.println(count);
+  Serial.println("----------------------------------");
+  
+  for (int i = 0; i < count; i++) {
+    DeviceAddress address;
+    if (sensors.getAddress(address, i)) {
+      Serial.print("Датчик под Индексом [");
+      Serial.print(i);
+      Serial.print("] имеет ID: { ");
+      for (uint8_t j = 0; j < 8; j++) {
+        Serial.print("0x");
+        if (address[j] < 16) Serial.print("0"); // Добавляем ноль для красоты
+        Serial.print(address[j], HEX);
+        if (j < 7) Serial.print(", ");
+      }
+      Serial.println(" }");
+    }
+  }
+  Serial.println("----------------------------------");
+  Serial.println("Сканирование завершено. Можете скопировать адреса.");
+
+// Поиск ID датчиков температуры
+// выполняется разово
+// ------------------------------------------
+/*
 
   // Настройка пинов для оптопар PC817 (обязательно PULLUP)
   pinMode(HANDBRAKE_PIN, INPUT_PULLUP);
@@ -43,9 +75,13 @@ void setup() {
   
   CAN0.setMode(MCP_NORMAL);   // Переводим CAN в рабочий режим
   pinMode(CAN_INT_PIN, INPUT); 
+
+  */
 }
 
 void loop() {
+
+  /*
   // --- 1. ОПРОС ДАТЧИКОВ С ОПТОПАРЫ PC817 (Вывод только при изменении) ---
   static unsigned long lastDebounceTimeHandbrake = 0;
   static unsigned long lastDebounceTimeTurn = 0;
@@ -140,4 +176,6 @@ void loop() {
     Serial.println(" %");
     Serial.println();
   }
+
+  */
 }
