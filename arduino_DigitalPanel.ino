@@ -131,15 +131,49 @@ void loop() {
     sensors.requestTemperatures(); // Запрос у всех датчиков
 
     // Чтение строго по ID адресам
-    float tInter = sensors.getTempC(interTempSensor);
-    float tOuter = sensors.getTempC(outerTempSensor);
+    float currentInter = sensors.getTempC(interTempSensor);
+    float currentOuter = sensors.getTempC(outerTempSensor);
 
-    // Вывод температур в Монитор порта
+    // Статические переменные для хранения ПОСЛЕДНЕГО УСПЕШНОГО значения
+    static float lastValidInter = -127.0; // Стартовое значение по умолчанию
+    static float lastValidOuter = -127.0;
+
+    // Счетчики ошибок для каждого датчика
+    static int errorCountInter = 0;
+    static int errorCountOuter = 0;
+
+    // Фильтр для Мотора: обновляем значение, только если нет ошибки -127
+    if (currentInter != DEVICE_DISCONNECTED_C) {
+      lastValidInter = currentInter;
+      errorCountInter = 0;
+    } else {
+      errorCountInter++;             // Контакт отошел, фиксируем пропуск
+    }
+    
+    // Фильтр для Улицы: обновляем значение, только если нет ошибки -127
+    if (currentOuter != DEVICE_DISCONNECTED_C) {
+      lastValidOuter = currentOuter;
+      errorCountOuter = 0; 
+    } else {
+      errorCountOuter++;             
+    }
+    // Вывод ТЕПЕРЬ ВСЕГДА КРАСИВЫЙ (без -127)
     Serial.print("  [TEMP] Салон: ");
-    if (tInter == DEVICE_DISCONNECTED_C) Serial.print("ОШИБКА (-127)"); else Serial.print(tInter, 1);
-    Serial.print(" °C | Улица: ");
-    if (tOuter == DEVICE_DISCONNECTED_C) Serial.print("ОШИБКА (-127)"); else Serial.print(tOuter, 1);
-    Serial.println(" °C");
+     // Если датчик не работает со старта ИЛИ оборван более 3-х раз подряд (9 секунд)
+    if (lastValidInter == -127.0 || errorCountInter >= 3) {
+      Serial.print("ОБРЫВ ПРОВОДА!");
+    } else {
+      Serial.print(lastValidInter, 1);
+      Serial.print(" °C");
+    }
+
+    Serial.print(" | Улица: ");
+    if (lastValidOuter == -127.0 || errorCountOuter >= 3) {
+      Serial.print("ОБРЫВ ПРОВОДА!");
+    } else {
+      Serial.print(lastValidOuter, 1);
+      Serial.print(" °C");
+    }
 
     // Вывод уровня топлива в Монитор порта
     Serial.print("  [FUEL] Значение АЦП: ");
