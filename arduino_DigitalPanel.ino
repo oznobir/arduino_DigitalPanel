@@ -1,40 +1,23 @@
 #include <SPI.h>
 #include <mcp_can.h>
-#include <OneWire.h>
-#include <DallasTemperature.h>
+//#include <OneWire.h>
+//#include <DallasTemperature.h>
 
-#define ONE_WIRE_BUS 14 // Датчики сидят на цифровом пине 14
-OneWire oneWire(ONE_WIRE_BUS);
-DallasTemperature sensors(&oneWire);
-
-// Жестко прописываем уникальные ID адреса датчиков
-DeviceAddress interTempSensor = { 0x28, 0x79, 0xF4, 0xC8, 0x00, 0x00, 0x00, 0x8C };
-DeviceAddress outerTempSensor = { 0x28, 0xC5, 0xD7, 0xC9, 0x00, 0x00, 0x00, 0xCF };
+//#define ONE_WIRE_BUS 14 // Датчики сидят на цифровом пине 14
+//OneWire oneWire(ONE_WIRE_BUS);
+//DallasTemperature sensors(&oneWire);
 
 // Настройка пинов 
 const int CAN_CS_PIN = 53;     // Пин CS для MCP2515 (на Arduino Mega)
-const int CAN_INT_PIN = 2;     // Пин прерывания INT для MCP2515
-const int HANDBRAKE_PIN = 16;   // Подключение ручника (через оптопару)
-const int TURN_LEFT_PIN = 17;   // Подключение поворотника (через оптопару)
-const int FUEL_PIN = A0;       // Пин ДУТ с фильтром и защитой
 
 MCP_CAN CAN0(CAN_CS_PIN);       // Инициализация объекта CAN
 
-// Переменные таймера для опроса температуры (чтобы не тормозить CAN-шину)
-unsigned long lastTempRequest = 0;
-const unsigned long tempInterval = 3000; // Опрос температуры раз в 3 секунды
-
-// Переменные для отслеживания изменения состояния входов (защита от спама в порт)
-bool lastHandbrakeState = HIGH;
-bool lastTurnLeftState = HIGH;
-
 void setup() {
   Serial.begin(115200); // Скорость Монитора порта — 115200
-  sensors.begin();
+ 
+  while(!Serial); // Ожидание открытия Монитора порта
 
-  // Настройка пинов для оптопар PC817 (обязательно PULLUP)
-  pinMode(HANDBRAKE_PIN, INPUT_PULLUP);
-  pinMode(TURN_LEFT_PIN, INPUT_PULLUP);
+  Serial.println("=== ТЕСТ CAN-МОДУЛЯ MCP2515 В РЕЖИМЕ LOOPBACK ===");
 
   // Инициализация MCP2515. На Almera G15 скорость шины обычно 500 Кбит/с.
   // Кварц на плате MCP2515 стоит на 8 МГц.
@@ -44,54 +27,70 @@ void setup() {
     Serial.println("Ошибка инициализации MCP2515...");
     while(1); // Останавливаем выполнение при ошибке
   }
-  
+  /*
   CAN0.setMode(MCP_NORMAL);   // Переводим CAN в рабочий режим
   pinMode(CAN_INT_PIN, INPUT); 
 
   Serial.println("=== СИСТЕМА ЗАПУЩЕНА И НАДЕЖНО ЗАПИТАНА ПО VIN ===");
+  */
+  // Переводим модуль в режим LOOPBACK (Сам отправил — сам принял)
+  if (CAN0.setMode(MCP_LOOPBACK) == CAN_OK) {
+    Serial.println(">>> Режим Loopback успешно включен. Начинаем тест...");
+  } else {
+    Serial.println("!!! Не удалось переключить модуль в режим Loopback.");
+  }
 
 }
+unsigned long lastTxTime = 0; 
+byte testData[8] = {0xAA, 0xBB, 0xCC, 0x11, 0x22, 0x33, 0x44, 0x55}; // Тестовые байты
 
 void loop() {
-  // --- 1. ОПРОС ДАТЧИКОВ С ОПТОПАРЫ PC817 (Вывод только при изменении) ---
-  static unsigned long lastDebounceTimeHandbrake = 0;
-  static unsigned long lastDebounceTimeTurn = 0;
-  const unsigned long debounceDelay = 50; // Время фильтрации дребезга (50 мс)
-
-  // Проверка РУЧНИКА
-  bool readingHandbrake = digitalRead(HANDBRAKE_PIN);
-  if (readingHandbrake != lastHandbrakeState) {
-    // Если состояние изменилось, запускаем/сбрасываем таймер
-    if (millis() - lastDebounceTimeHandbrake > debounceDelay) {
-      if (readingHandbrake == LOW) {
-       Serial.println("  [Сигнал]>>> Ручник затянут!");
-      } else {
-       Serial.println("  [Сигнал]>>> Ручник отпущен.");
+  
+  // 1. ОТПРАВКА КАН-ПАКЕТА (Раз в 2 секунды)
+  if (millis() - lastTxTime >= 2000) {
+    lastTxTime = millis();
+    
+    // Отправляем пакет: ID = 0x100, Стандартный фрейм (0), Длина данных = 8 байт, Массив данных
+    byte sndStat = CAN0.sendMsgBuf(0x100, 0, 8, testData);
+    
+    if (sndStat == CAN_OK) {
+      Serial.println("--------------------------------");
+      Serial.print("Отправлен CAN-пакет с ID: 0x100 | Данные: ");
+      for(int i = 0; i<8; i++) {
+        Serial.print("0x");
+        Serial.print(testData[i], HEX);
+        Serial.print(" ");
       }
-      lastHandbrakeState = readingHandbrake;
-      lastDebounceTimeHandbrake = millis();
+      Serial.println();
+    } else {
+      Serial.println("!!! Ошибка отправки пакета.");
     }
-  } else {
-    lastDebounceTimeHandbrake = millis(); // Сброс таймера, если состояние стабильно
+    
+    // Немного изменяем первый байт для наглядности при следующей отправке
+    testData[0]++; 
   }
 
-  // Проверка ПОВОРОТНИКА
-  bool readingTurnLeft = digitalRead(TURN_LEFT_PIN);
-  if (readingTurnLeft != lastTurnLeftState) {
-   if (millis() - lastDebounceTimeTurn > debounceDelay) {
-      if (readingTurnLeft == LOW) {
-        Serial.println("  [Сигнал]>>> Левый поворотник включен!");
-      } else {
-        Serial.println("  [Сигнал]>>> Левый поворотник выключен.");
-     }
-     lastTurnLeftState = readingTurnLeft;
-     lastDebounceTimeTurn = millis();
+  // 2. ПРИЕМ КАН-ПАКЕТА (Проверяем буфер каждую миллисекунду)
+  if (CAN0.checkReceive() == CAN_MSGAVAIL) {
+    long unsigned int rxId;
+    unsigned char len = 0;
+    unsigned char rxBuf[8];
+    
+    // Читаем данные из буфера модуля
+    CAN0.readMsgBuf(&rxId, &len, rxBuf);
+    
+    // Если поймали наш же пакет
+    Serial.print("УСПЕШНО ПРИНЯТ CAN-пакет! ID: 0x");
+    Serial.print(rxId, HEX);
+    Serial.print(" | Данные: ");
+    for(int i = 0; i<len; i++) {
+      Serial.print("0x");
+      Serial.print(rxBuf[i], HEX);
+      Serial.print(" ");
     }
-  } else {
-    lastDebounceTimeTurn = millis();
+    Serial.println();
   }
-
-  // --- 2. ЧТЕНИЕ ДАННЫХ ИЗ CAN-ШИНЫ АВТОМОБИЛЯ (Мгновенно) ---
+/*
   if(!digitalRead(CAN_INT_PIN)) { // Если пришел пакет (пин INT упал в LOW)
     long unsigned int rxId;
     unsigned char len = 0;
@@ -110,77 +109,5 @@ void loop() {
     }
     Serial.println();
   }
-
-  // --- 3. ЗАПРОС ТЕМПЕРАТУРЫ DS18B20 ПО ТАЙМЕРУ ---
-  if (millis() - lastTempRequest >= tempInterval) {
-    lastTempRequest = millis(); // Сброс таймера
-
-    // Чтение датчика уровня топлива
-    int rawFuel = analogRead(FUEL_PIN); // Считываем АЦП (получим от 0 до ~769)
-  
-    // Калибровка под потенциометр B1k и резистор 330 Ом
-    // R1 (330 Ом) и R2 (1000 Ом). Всего 1330 Ом. 
-    // 5в*(1000 Ом/1330 Ом) = 3,76в
-    // 3,76в/5в*1023 = 769 АЦП
-    // 0 Ом (пустой бак) = 0 АЦП. 1000 Ом (полный бак) = 769 АЦП.
-    int fuelPercent = map(rawFuel, 0, 769, 0, 100); 
-  
-    // Защита от выхода за границы 0-100% (если потенциометр выдаст чуть больше 769)
-    fuelPercent = constrain(fuelPercent, 0, 100); 
-    
-    sensors.requestTemperatures(); // Запрос у всех датчиков
-
-    // Чтение строго по ID адресам
-    float currentInter = sensors.getTempC(interTempSensor);
-    float currentOuter = sensors.getTempC(outerTempSensor);
-
-    // Статические переменные для хранения ПОСЛЕДНЕГО УСПЕШНОГО значения
-    static float lastValidInter = -127.0; // Стартовое значение по умолчанию
-    static float lastValidOuter = -127.0;
-
-    // Счетчики ошибок для каждого датчика
-    static int errorCountInter = 0;
-    static int errorCountOuter = 0;
-
-    // Фильтр для Мотора: обновляем значение, только если нет ошибки -127
-    if (currentInter != DEVICE_DISCONNECTED_C) {
-      lastValidInter = currentInter;
-      errorCountInter = 0;
-    } else {
-      errorCountInter++;             // Контакт отошел, фиксируем пропуск
-    }
-    
-    // Фильтр для Улицы: обновляем значение, только если нет ошибки -127
-    if (currentOuter != DEVICE_DISCONNECTED_C) {
-      lastValidOuter = currentOuter;
-      errorCountOuter = 0; 
-    } else {
-      errorCountOuter++;             
-    }
-    // Вывод ТЕПЕРЬ ВСЕГДА КРАСИВЫЙ (без -127)
-    Serial.print("  [TEMP] Салон: ");
-     // Если датчик не работает со старта ИЛИ оборван более 3-х раз подряд (9 секунд)
-    if (lastValidInter == -127.0 || errorCountInter >= 3) {
-      Serial.print("ОБРЫВ ПРОВОДА!");
-    } else {
-      Serial.print(lastValidInter, 1);
-      Serial.print(" °C");
-    }
-
-    Serial.print(" | Улица: ");
-    if (lastValidOuter == -127.0 || errorCountOuter >= 3) {
-      Serial.print("ОБРЫВ ПРОВОДА!");
-    } else {
-      Serial.print(lastValidOuter, 1);
-      Serial.print(" °C");
-    }
-
-    // Вывод уровня топлива в Монитор порта
-    Serial.print("  [FUEL] Значение АЦП: ");
-    Serial.print(rawFuel);
-    Serial.print(" из 769 | Уровень в баке: ");
-    Serial.print(fuelPercent);
-    Serial.println(" %");
-    Serial.println();
-  }
+*/
 }
