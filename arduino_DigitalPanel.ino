@@ -9,15 +9,21 @@
 
 // Настройка пинов 
 const int CAN_CS_PIN = 53;     // Пин CS для MCP2515 (на Arduino Mega)
-
 MCP_CAN CAN0(CAN_CS_PIN);       // Инициализация объекта CAN
+
+// Настройка интервала опроса ГБО
+unsigned long lastGboRequest = 0;
+const unsigned long gboInterval = 1000; // Опрашиваем ГБО раз в 1 секунду
 
 void setup() {
   Serial.begin(115200); // Скорость Монитора порта — 115200
- 
   while(!Serial); // Ожидание открытия Монитора порта
 
   Serial.println("=== ТЕСТ CAN-МОДУЛЯ MCP2515 В РЕЖИМЕ LOOPBACK ===");
+
+  // Инициализируем Serial1 для связи с ГБО на штатной скорости 57600
+  Serial1.begin(57600); 
+  Serial.println("=== МОДУЛЬ ГБО ИНИЦИАЛИЗИРОВАН ===");
 
   // Инициализация MCP2515. На Almera G15 скорость шины обычно 500 Кбит/с.
   // Кварц на плате MCP2515 стоит на 8 МГц.
@@ -110,4 +116,33 @@ void loop() {
     Serial.println();
   }
 */
+// --- ТАЙМЕР ОПРОСА ГБО ---
+  if (millis() - lastGboRequest >= gboInterval) {
+    lastGboRequest = millis();
+
+    // Очищаем буфер перед отправкой нового запроса, если там скопился мусор
+    while(Serial1.available() > 0) {
+      Serial1.read(); 
+    }
+
+    // Отправляем стартовый байт запроса 'S' (0x53) в блок ГБО
+    Serial1.write(0x53); 
+    Serial.println("[ГБО] Отправлен запрос 0x53 ('S'). Ждем ответ...");
+  }
+
+  // --- ПРИЕМ ДАННЫХ ОТ ГБО ---
+  // Если в буфер Serial1 прилетели байты от газового блока
+  if (Serial1.available() > 0) {
+    Serial.print("[ГБО] Получены байты (HEX): ");
+    
+    // Считываем всё, что пришло, и выводим в Монитор порта для изучения
+    while (Serial1.available() > 0) {
+      byte inByte = Serial1.read();
+      Serial.print("0x");
+      if (inByte < 16) Serial.print("0");
+      Serial.print(inByte, HEX);
+      Serial.print(" ");
+    }
+    Serial.println("\n");
+  }
 }
