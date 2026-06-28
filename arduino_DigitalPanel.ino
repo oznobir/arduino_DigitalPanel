@@ -36,7 +36,7 @@ void setup() {
 
   // Инициализация MCP2515. На Almera G15 скорость шины обычно 500 Кбит/с.
   // Кварц на плате MCP2515 стоит на 8 МГц.
-  if(CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_8MHz) == CAN_OK) {
+  if(CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) == CAN_OK) {
     Serial.println("=== MCP2515 успешно запущен! ===");
   } else {
     Serial.println("=== Ошибка инициализации MCP2515... ===");
@@ -66,7 +66,7 @@ void loop() {
  // --- 1. ОТПРАВКА ЗАПРОСА ОБОРОТОВ ---
   if (millis() - lastObdRequest >= obdInterval) {
     lastObdRequest = millis();
-    byte obdQuery = {0x02, 0x01, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00};
+    byte obdQuery[] = {0x02, 0x01, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00};
     CAN0.sendMsgBuf(0x7DF, 0, 8, obdQuery);
     Serial.println("[OBD2] Отправлен запрос RPM (PID 0x0C)...");
   }
