@@ -21,6 +21,15 @@ void CAN_ISR() {
 // Настройка интервала опроса ГБО
 unsigned long lastGboRequest = 0;
 const unsigned long gboInterval = 1000; // Опрашиваем ГБО раз в 1 секунду
+
+// Переменные, куда мы сохраним вытащенные данные ГБО
+int gboRpm = 0;
+float gboGasPress = 0.0;
+int gboTempReducer = 0;
+int gboTempGas = 0;
+float gboInjPetrol = 0.0;
+float gboInjGas = 0.0;
+
 // Настройка интервала опроса OBD2
 unsigned long lastObdRequest = 0;
 const unsigned long obdInterval = 1000; // Запрос каждую 1 секунду
@@ -29,8 +38,9 @@ void setup() {
   Serial.begin(115200); // Скорость Монитора порта — 115200
   while(!Serial); // Ожидание открытия Монитора порта
 
-  // Инициализируем Serial1 для связи с ГБО на штатной скорости 57600
-  Serial1.begin(57600); 
+  // Инициализируем Serial1 для связи с ГБО на штатной скорости 57600 
+  Serial1.begin(57600); // Для Stag-300 ISA2 (скорость зафиксирована!)
+
   Serial.println("=== МОДУЛЬ ГБО ИНИЦИАЛИЗИРОВАН ===");
   Serial.println("=== ЗАПУСК ЭМУЛЯТОРА ELM327 (ЗАПРОСЫ OBD2) ===");
 
@@ -100,36 +110,59 @@ void loop() {
       }
     }
   }
-
-// --- ТАЙМЕР ОПРОСА ГБО QMAX (Раз в 1 секунду) ---
+  // На блоке написано STAG-300-4 Qmax basic. Оказалось это китайский клон Stag-300 isa2
+  // Cамый первый вариант кода с байт 'S' не сработал, видимо, из-за резисторов 1кОм между RX, TX и пинами Ардуино
+  // Второй вариант кода естественно не заработал, т.к. он для Q-генерации блоков STAG
+  // Теперь возрат к первому варианту кода, уменьшив резисторы до 220 Ом
+  // --- 1. ТАЙМЕР ОТПРАВКИ ЗАПРОСА ---
   if (millis() - lastGboRequest >= gboInterval) {
     lastGboRequest = millis();
-
-    // Очищаем буфер от старого мусора
-    while(Serial1.available() > 0) { Serial1.read(); }
-
-    // Формируем правильный пакет запроса параметров для блоков Q-generation
-    // 0xE4 - маркер начала, 0x00 - длина доп. данных, 0x53 ('S') - команда запроса, 0x37 - CRC
-    byte qmaxRequest[] = {0xE4, 0x00, 0x53, 0x37};
     
-    // Отправляем массив из 4 байт в Serial1
-    Serial1.write(qmaxRequest, 4); 
-    Serial.println("[ГБО] Отправлен пакет инициализации QMAX. Ждем ответ...");
+    // Очищаем старый мусор, если он есть в буфере
+    while(Serial1.available() > 0) Serial1.read(); 
+
+    // Отправляем заветный байт 'S'
+    Serial1.write(0x53); 
+    Serial.println("[ГБО] Отправлен байт 'S'. Ждем ответ...");
   }
+  // --- 2. ПРИЕМ И РАСШИФРОВКА ОТВЕТА ---
+  // Stag-300 ISA2 обычно присылает пакет длиной более 30 байт. 
+  // Ждем, пока в буфере накопится хотя бы 30 байт данных.
+  if (Serial1.available() >= 30) {
+    byte gboBuf[64]; // Создаем временный массив для пакета
+    int bytesRead = 0;
 
-  // --- ПРИЕМ ДАННЫХ ОТ ГБО ---
-  if (Serial1.available() > 0) {
-    // Даем блоку QMAX долю секунды, чтобы дописать весь пакет в буфер Ардуино
-    delay(20); 
-    
-    Serial.print("[ГБО] Ответ от QMAX (HEX): ");
-    while (Serial1.available() > 0) {
-      byte inByte = Serial1.read();
-      Serial.print("0x");
-      if (inByte < 16) Serial.print("0");
-      Serial.print(inByte, HEX);
-      Serial.print(" ");
+    // Вычитываем байты из порта в наш массив
+    while (Serial1.available() > 0 && bytesRead < 64) {
+      gboBuf[bytesRead] = Serial1.read();
+      bytesRead++;
     }
-    Serial.println("\n");
+  // --- ПАРСИНГ (РАСШИФРОВКА) ДАННЫХ ПО ИНДЕКСАМ ---
+  // Формулы перевода сырых байт в человеческие значения для ISA2:
+  
+    // Обороты двигателя: склеиваем два байта (старший и младший)
+    gboRpm = (gboBuf[1] << 8) | gboBuf[2]; 
+
+    // Время впрыска (в миллисекундах): делим на 100 для точности до сотых
+    gboInjPetrol = ((gboBuf[3] << 8) | gboBuf[4]) / 100.0;
+    gboInjGas    = ((gboBuf[5] << 8) | gboBuf[6]) / 100.0;
+
+    // Температуры редуктора и газа (в протоколе ISA2 они идут со смещением или напрямую)
+    gboTempReducer = gboBuf[7];
+    gboTempGas     = gboBuf[8];
+
+    // Давление газа (МАР): склеиваем два байта и переводим в Бары/Атмосферы
+    int rawPress = (gboBuf[9] << 8) | gboBuf[10];
+    gboGasPress = rawPress / 100.0; 
+
+    // --- ВЫВОД РЕЗУЛЬТАТОВ В МОНИТОР ПОРТА ---
+    Serial.println("====== ДАННЫЕ ИЗ ГАЗОВОГО БЛОКА ======");
+    Serial.print("  Обороты: "); Serial.print(gboRpm); Serial.println(" об/мин");
+    Serial.print("  Впрыск Бензина: "); Serial.print(gboInjPetrol, 2); Serial.println(" мс");
+    Serial.print("  Впрыск Газа: "); Serial.print(gboInjGas, 2); Serial.println(" мс");
+    Serial.print("  Темп. Редуктора: "); Serial.print(gboTempReducer); Serial.println(" °C");
+    Serial.print("  Темп. Газа: "); Serial.print(gboTempGas); Serial.println(" °C");
+    Serial.print("  Давление Газа: "); Serial.print(gboGasPress, 2); Serial.println(" Бар");
+    Serial.println("======================================\n");
   }
 }
