@@ -102,12 +102,12 @@ void loop() {
           Serial.print(" | ОБОРОТЫ: ");
           Serial.print(rpm);
           Serial.println(" об/мин");
-        }
-      } else {
+        } else {
         Serial.print("[CAN Попутный] ID: 0x");
         Serial.print(rxId, HEX);
         Serial.println();
-      }
+        }
+      } 
     }
   }
   // На блоке написано STAG-300-4 Qmax basic. Оказалось это китайский клон Stag-300 isa2
