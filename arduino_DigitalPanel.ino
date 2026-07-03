@@ -4,21 +4,36 @@
 const int SPI_CS_PIN = 9;
 MCP_CAN CAN0(SPI_CS_PIN);
 
-unsigned long lastByteTime = 0;
-int byteCounter = 0;
+// Структура для управления каждым каналом
+struct SerialChannel {
+  HardwareSerial* port;
+  String name;
+  byte buf[100];
+  int count;
+  unsigned long lastByteTime;
+  bool isCapture;
+};
+
+// Инициализируем каналы: ПК (Serial2, пин 17) и ГБО (Serial1, пин 19)
+SerialChannel chPC =  {&Serial2, "   [ПК -> ГБО]  ", {0}, 0, 0, false};
+SerialChannel chGBO = {&Serial1, "   [ГБО -> ПК]  ", {0}, 0, 0, false};
 
 void setup() {
-  Serial.begin(115200);   // Монитор порта ПК на 115200
-  Serial1.begin(9600);    // ИСТИННАЯ СКОРОСТЬ ГБО - 9600 БОД!
+  Serial.begin(115200);   // Монитор порта для связи с компьютером (Ардуино -> ПК)
+  Serial1.begin(9600);    // Слушаем RXD свистка (Ответы ГБО)
+  Serial2.begin(9600);    // Слушаем TXD свистка (Запросы ПК)
   
-  // Оставляем подтяжку, которая спасла наш сигнал
-  pinMode(19, INPUT_PULLUP); 
+  // Активируем спасительную подтяжку на обоих принимающих пинах
+  pinMode(19, INPUT_PULLUP); // RX1
+  pinMode(17, INPUT_PULLUP); // RX2
 
+  // Очищаем буферы
   while(Serial1.available() > 0) Serial1.read();
+  while(Serial2.available() > 0) Serial2.read();
 
   Serial.println(F("=================================================="));
-  Serial.println(F("===      ПАССИВНЫЙ СНИФФЕР ГБО НА 9600 БОД     ==="));
-  Serial.println(F("===    Слушаем линию RXD работающего свистка   ==="));
+  Serial.println(F("===        ДВУХКАНАЛЬНЫЙ СНИФФЕР ПК <=> ГБО    ==="));
+  Serial.println(F("=== Скорость: 9600 | Ждем маркер старта 0xF0   ==="));
   Serial.println(F("=================================================="));
 
   if(CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) == CAN_OK) {
@@ -26,34 +41,56 @@ void setup() {
   }
 }
 
-void loop() {
-  if (Serial1.available() > 0) {
-    // На 9600 бод байты идут медленнее, поэтому таймаут конца пакета увеличиваем до 45 мс
-    if (millis() - lastByteTime > 45) { 
-      Serial.println(F("\n----------------------------------------"));
-      Serial.print(F(">>> ПЕРЕХВАЧЕН ПАКЕТ (Длина прошлого: "));
-      Serial.print(byteCounter);
-      Serial.println(F(" байт) <<<"));
-      Serial.println(F("----------------------------------------"));
-      byteCounter = 0;
-    }
-    
-    byte c = Serial1.read();
-    lastByteTime = millis();
+// Функция обработки потока данных для конкретного канала
+void processChannel(SerialChannel& ch) {
+  while (ch.port->available() > 0) {
+    byte c = ch.port->read();
+    unsigned long now = millis();
 
-    // Выводим байт в Монитор порта
-    Serial.print(F("["));
-    if(byteCounter < 10) Serial.print(F("0"));
-    Serial.print(byteCounter);
-    Serial.print(F("] HEX: 0x"));
-    if(c < 16) Serial.print(F("0"));
-    Serial.print(c, HEX);
-    Serial.print(F(" (DEC: "));
-    Serial.print(c);
-    Serial.println(F(")"));
-    
-    byteCounter++;
+    // Если мы еще не ловим пакет, ищем маркер начала 0xF0
+    if (!ch.isCapture) {
+      if (c == 0xF0) {
+        ch.isCapture = true;
+        ch.count = 0;
+        ch.buf[ch.count++] = c;
+        ch.lastByteTime = now;
+      }
+    } 
+    // Если пакет уже захвачен, складываем байты в буфер
+    else {
+      if (ch.count < 100) {
+        ch.buf[ch.count++] = c;
+      }
+      ch.lastByteTime = now;
+    }
   }
+
+  // Если пакет захвачен и наступила пауза (нет байт более 30 мс) -> выводим лог кадра
+  if (ch.isCapture && (millis() - ch.lastByteTime > 30)) {
+    Serial.println(ch.name);
+    Serial.print(F("Старт: 0xF0 | Длина: ")); 
+    Serial.print(ch.count); 
+    Serial.println(F(" байт"));
+    
+    // Красивый побайтный вывод пакета в одну строчку для легкого чтения
+    Serial.print(F("Дамп: "));
+    for (int i = 0; i < ch.count; i++) {
+      Serial.print(F("0x"));
+      if (ch.buf[i] < 16) Serial.print(F("0"));
+      Serial.print(ch.buf[i], HEX);
+      Serial.print(F(" "));
+    }
+    Serial.println(F("\n--------------------------------------------------"));
+    
+    // Сбрасываем триггер для ожидания следующего пакета
+    ch.isCapture = false;
+    ch.count = 0;
+  }
+}
+
+void loop() {
+  processChannel(chPC);  // Опрашиваем линию отправки компьютера
+  processChannel(chGBO); // Опрашиваем линию ответа газового блока
 }
 
 // #include <SPI.h>
