@@ -4,23 +4,30 @@
 const int SPI_CS_PIN = 9;
 MCP_CAN CAN0(SPI_CS_PIN);
 
-byte txBuffer[128]; // Буфер для отправки
-int txCount = 0;
-byte rxBuffer[256]; // Буфер для приема
+//ПОБЕДНЫЙ ЗАПРОС (4 байта)
+byte masterQuery[] = {0xF0, 0x01, 0x01, 0xF2}; 
+byte gboBuf[85];
+unsigned long lastQueryTime = 0;
+
+// ПЕРЕМЕННЫЕ ДЛЯ ПРИБОРНОЙ ПАНЕЛИ
+float injBenz = 0.0; // Время впрыска бензина (цил 1)
+float injGas = 0.0;  // Время впрыска газа (цил 1)
+int engineRpm = 0;   // Обороты
+float pressGas = 0.0; // Давление газа
+float pressMap = 0.0; // Давление MAP
+int tempGas = 0;     // Температура газа
+int tempRed = 0;     // Температура редуктора
+bool isGasActive = false; // На каком топливе едем
+int gasLiters = 0; 
+
 
 void setup() {
-  Serial.begin(115200); // Связь с ПК (настраивайте Монитор порта на 115200)
-  Serial1.begin(9600);  // Связь со Stag (9600 бод)
-  
-  pinMode(19, INPUT_PULLUP); // Наша спасительная подтяжка уровня
+  Serial.begin(115200);
+  Serial1.begin(9600); // 9600 бод
+  pinMode(19, INPUT_PULLUP); // Подтяжка
 
-  // Настройка перевода строки в Мониторе порта: ОБЯЗАТЕЛЬНО выберите "Newline" (Новая строка) или "Both NL & CR"
   while(Serial1.available() > 0) Serial1.read();
-  
-  Serial.println(F("=================================================="));
-  Serial.println(F("===         ИНТЕРАКТИВНЫЙ ТЕРМИНАЛ STAG        ==="));
-  Serial.println(F("=== Вводите байты через пробел. Пример: F0 01 1 0хF2 ==="));
-  Serial.println(F("=================================================="));
+  Serial.println(F("=== СТАГ v11.3: ОКОНЧАТЕЛЬНЫЙ БОРТОВОЙ КОМПЬЮТЕР ==="));
 
   if(CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) == CAN_OK) {
     CAN0.setMode(MCP_LISTENONLY); 
@@ -28,99 +35,96 @@ void setup() {
 }
 
 void loop() {
-  // 1. ЧТЕНИЕ КОМАНДЫ ИЗ МОНИТОРА ПОРТА (ПК -> Ардуино)
-  if (Serial.available() > 0) {
-    String inputStr = Serial.readStringUntil('\n');
-    inputStr.trim(); // Убираем лишние пробелы по краям
-    
-    if (inputStr.length() > 0) {
-      txCount = 0;
-      
-      // Парсим строку, разбивая по пробелам
-      int pos = 0;
-      while (pos < inputStr.length() && txCount < 128) {
-        // Пропускаем пробелы
-        while (pos < inputStr.length() && inputStr[pos] == ' ') pos++;
-        if (pos >= inputStr.length()) break;
-        
-        // Выделяем отдельный токен (байт в виде текста)
-        String token = "";
-        while (pos < inputStr.length() && inputStr[pos] != ' ') {
-          token += inputStr[pos];
-          pos++;
-        }
-        
-        // Убираем префикс "0x" или "0X", если вы случайно его ввели
-        if (token.startsWith("0x") || token.startsWith("0X")) {
-          token = token.substring(2);
-        }
-        
-        // Преобразуем HEX-текст в реальный байт
-        if (token.length() > 0) {
-          txBuffer[txCount++] = (byte) strtol(token.c_str(), NULL, 16);
-        }
-      }
-      
-      // Отправляем сформированный пакет в ГБО
-      if (txCount > 0) {
-        while(Serial1.available() > 0) Serial1.read(); // Чистим приемный буфер перед отправкой
-        
-        Serial.print(F("\n[ПК -> ГБО] Отправлено "));
-        Serial.print(txCount);
-        Serial.print(F(" байт: "));
-        for(int i=0; i<txCount; i++) {
-          Serial.print(F("0x"));
-          if(txBuffer[i] < 16) Serial.print(F("0"));
-          Serial.print(txBuffer[i], HEX);
-          Serial.print(F(" "));
-        }
-        Serial.println();
-        
-        // Физическая отправка в белый провод
-        Serial1.write(txBuffer, txCount);
-        delay(20); // Даем небольшую паузу Stag на обработку
-      }
-    }
+  unsigned long now = millis();
+
+  // Запрашиваем данные из Stag каждые 200 мс
+  if (now - lastQueryTime >= 200) {
+    lastQueryTime = now;
+    while(Serial1.available() > 0) Serial1.read(); // Очищаем старый буфер
+    Serial1.write(masterQuery, sizeof(masterQuery)); 
   }
 
-  // 2. СБОР И ВЫВОД ОТВЕТА (ГБО -> ПК)
+  // Принимаем пакет параметров
   if (Serial1.available() > 0) {
-    delay(40); // Даем пакету накопиться в буфере UART (особенно длинным ответам)
-    
-    int rxCount = 0;
-    unsigned long packetTimer = millis();
-    
-    // Вычитываем всё, что пришло от Stag в ответ
-    while (millis() - packetTimer < 25 && rxCount < 256) {
-      if (Serial1.available() > 0) {
-        rxBuffer[rxCount++] = Serial1.read();
-        packetTimer = millis();
-      }
-    }
-    
-    // Красиво выводим ответ на экран
-    if (rxCount > 0) {
-      Serial.print(F("[ГБО -> ПК] Получен ответ (Длина: "));
-      Serial.print(rxCount);
-      Serial.println(F(" байт)"));
-      Serial.println(F("--------------------------------------------------"));
+    if (Serial1.peek() == 0xF0) {
+      delay(45); // Даем 83 байтам полностью зайти в порт
       
-      for (int i = 0; i < rxCount; i++) {
-        //Serial.print(F("["));
-        //if(i < 10) Serial.print(F("0"));
-        //Serial.print(i);
-        //Serial.print(F("] HEX: 0x"));
-        Serial.print(F(" 0x"));
-        if(rxBuffer[i] < 16) Serial.print(F("0"));
-        Serial.print(rxBuffer[i], HEX);
-        //Serial.print(F(" (DEC: "));
-        //Serial.print(rxBuffer[i]);
-        //Serial.println(F(")"));
+      byte m0 = Serial1.read();
+      byte m1 = Serial1.read();
+      byte packetLen = Serial1.read();
+      
+      // Если пришел наш пакет параметров (83 байта)
+      if (packetLen == 0x53) {
+        // Читаем оставшиеся 80 байт в буфер (начиная с индекса 3)
+        for (int i = 3; i < 83; i++) {
+          gboBuf[i] = Serial1.read();
+        }
+        
+        // --- ДЕКОДИРОВАНИЕ ПАРАМЕТРОВ ПО НАЙДЕННЫМ ИНДЕКСАМ ---
+        
+        // 1. Время впрыска (Бензин и Газ по 1-му цилиндру)
+        int rawBenz = (gboBuf[11] << 8) | gboBuf[10];
+        injBenz = rawBenz / 10.0;
+        
+        int rawGas = (gboBuf[27] << 8) | gboBuf[26];
+        injGas = rawGas / 10.0;
+        
+        // 2. Обороты двигателя
+        engineRpm = gboBuf[4] * 100;
+        if (engineRpm < 0) engineRpm = 0;
+        
+        // 3. Давления (Газ и MAP)
+        pressGas = gboBuf[6] * 0.0033; // Коэффициент под 0.44 Бар при значении 133
+        pressMap = gboBuf[7] * 0.0029; // Коэффициент под 0.38 Бар при значении 132
+        
+        
+        // 4. Температуры
+        tempGas = gboBuf[53];
+        tempRed = gboBuf[54];
+        
+        // 5. Текущее топливо
+        // Если кнопка активна и машина перешла на газ, байт становится равен 0x1B (или имеет нулевой 1-й бит)
+        if (gboBuf[56] == 0x1B || injGas > 0.5) {
+          isGasActive = true;
+        } else {
+          isGasActive = false;
+        }
+
+        // 6. Остаток газа
+        byte rawLevel = gboBuf[50]; // Получаем сырое значение (сейчас там 42)
+        // Переводим попугаи датчика (считаем, что пустой ~40, полный ~210) в реальные литры (от 0 до 48)
+        // !!!!!Внимание: точные цифры 40 и 210 НУЖНО скорректировать, когда баллон будет полностью пустой!!!!!
+        gasLiters = map(rawLevel, 40, 210, 0, 48); 
+        if (gasLiters < 0) gasLiters = 0;
+        if (gasLiters > 48) gasLiters = 48;
+
+        // ВЫВОД НА ПРИБОРКУ
+        printToDashboard();
+      } else {
+        // Если это 100-байтовый пакет карты — просто очищаем его из порта
+        for (int i = 3; i < packetLen; i++) {
+          if (Serial1.available() > 0) Serial1.read();
+        }
       }
-      Serial.println();
-      Serial.println(F("--------------------------------------------------"));
+    } else {
+      Serial1.read(); // Синхронизация
     }
   }
+}
+
+void printToDashboard() {
+  Serial.print(F("[ГБО] Топливо: "));
+  if (isGasActive) Serial.print(F("ГАЗ")); else Serial.print(F("БЕНЗИН"));
+  
+  Serial.print(F(" | Обороты: ")); Serial.print(engineRpm);
+  Serial.print(F(" | Впр_Бенз: ")); Serial.print(injBenz, 1); Serial.print(F("мс"));
+  Serial.print(F(" | Впр_Газ: ")); Serial.print(injGas, 1); Serial.print(F("мс"));
+  Serial.print(F(" | П_Газ: ")); Serial.print(pressGas, 2);
+  Serial.print(F(" | П_MAP: ")); Serial.print(pressMap, 2);
+  Serial.print(F(" | Т_Ред: ")); Serial.print(tempRed); Serial.print(F("°C"));
+  Serial.print(F(" | Т_Газ: ")); Serial.print(tempGas); Serial.print(F("°C"));
+  Serial.print(F(" | Остаток газа: ")); Serial.print(gasLiters); Serial.print(F(" л "));
+  Serial.println(F(")"));
 }
 
 // #include <SPI.h>
