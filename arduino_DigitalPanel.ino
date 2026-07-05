@@ -10,13 +10,21 @@ byte gboBuf[85];
 unsigned long lastQueryTime = 0;
 
 // ПЕРЕМЕННЫЕ ДЛЯ ПРИБОРНОЙ ПАНЕЛИ
-float injBenz = 0.0; // Время впрыска бензина (цил 1)
-float injGas = 0.0;  // Время впрыска газа (цил 1)
+float injBenz1 = 0.0; // Время впрыска бензина (цил 1)
+float injBenz2 = 0.0;
+float injBenz3 = 0.0;
+float injBenz4 = 0.0;
+float injGas1 = 0.0;  // Время впрыска газа (цил 1)
+float injGas2 = 0.0;  
+float injGas3 = 0.0;  
+float injGas4 = 0.0;  
 int engineRpm = 0;   // Обороты
 float pressGas = 0.0; // Давление газа
 float pressMap = 0.0; // Давление MAP
 int tempGas = 0;     // Температура газа
 int tempRed = 0;     // Температура редуктора
+float batteryVolt = 0.0;
+int engineLoad = 0;
 bool isGasActive = false; // На каком топливе едем
 int gasLiters = 0; 
 
@@ -27,7 +35,7 @@ void setup() {
   pinMode(19, INPUT_PULLUP); // Подтяжка
 
   while(Serial1.available() > 0) Serial1.read();
-  Serial.println(F("=== СТАГ v11.3: ОКОНЧАТЕЛЬНЫЙ БОРТОВОЙ КОМПЬЮТЕР ==="));
+  Serial.println(F("=== СТАГ v11.3: БОРТОВОЙ КОМПЬЮТЕР ==="));
 
   if(CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) == CAN_OK) {
     CAN0.setMode(MCP_LISTENONLY); 
@@ -37,8 +45,8 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // Запрашиваем данные из Stag каждые 200 мс
-  if (now - lastQueryTime >= 200) {
+  // Запрашиваем данные из Stag каждые 300 мс
+  if (now - lastQueryTime >= 300) {
     lastQueryTime = now;
     while(Serial1.available() > 0) Serial1.read(); // Очищаем старый буфер
     Serial1.write(masterQuery, sizeof(masterQuery)); 
@@ -47,7 +55,7 @@ void loop() {
   // Принимаем пакет параметров
   if (Serial1.available() > 0) {
     if (Serial1.peek() == 0xF0) {
-      delay(45); // Даем 83 байтам полностью зайти в порт
+      delay(100); // Даем 83 байтам полностью зайти в порт (45 мс мало)
       
       byte m0 = Serial1.read();
       byte m1 = Serial1.read();
@@ -63,40 +71,48 @@ void loop() {
         // --- ДЕКОДИРОВАНИЕ ПАРАМЕТРОВ ПО НАЙДЕННЫМ ИНДЕКСАМ ---
         
         // 1. Время впрыска (Бензин и Газ по 1-му цилиндру)
-        int rawBenz = (gboBuf[11] << 8) | gboBuf[10];
-        injBenz = rawBenz / 10.0;
         
-        int rawGas = (gboBuf[27] << 8) | gboBuf[26];
-        injGas = rawGas / 10.0;
+        injBenz1 = gboBuf[10] / 10.0;
+        injBenz2 = gboBuf[12] / 10.0;
+        injBenz3 = gboBuf[14] / 10.0;
+        injBenz4 = gboBuf[16] / 10.0;
         
+        injGas1 = gboBuf[26] / 10.0;
+        injGas2 = gboBuf[28] / 10.0;
+        injGas3 = gboBuf[30] / 10.0;
+        injGas4 = gboBuf[32] / 10.0;
         // 2. Обороты двигателя
-        engineRpm = gboBuf[4] * 100;
-        if (engineRpm < 0) engineRpm = 0;
+        engineRpm = (gboBuf[42] * 100) + gboBuf[43];
         
         // 3. Давления (Газ и MAP)
-        pressGas = gboBuf[6] * 0.0033; // Коэффициент под 0.44 Бар при значении 133
-        pressMap = gboBuf[7] * 0.0029; // Коэффициент под 0.38 Бар при значении 132
+        pressGas = gboBuf[45] * 0.01; 
+        pressMap = gboBuf[47] * 0.01;
         
         
         // 4. Температуры
-        tempGas = gboBuf[53];
-        tempRed = gboBuf[54];
+        tempRed = gboBuf[48];
+        tempGas = gboBuf[49];
         
         // 5. Текущее топливо
-        // Если кнопка активна и машина перешла на газ, байт становится равен 0x1B (или имеет нулевой 1-й бит)
-        if (gboBuf[56] == 0x1B || injGas > 0.5) {
+        if (injGas1 > 0.5 && injGas2 > 0.5 && injGas3 > 0.5  && injGas4 > 0.5) {
           isGasActive = true;
         } else {
           isGasActive = false;
         }
 
         // 6. Остаток газа
-        byte rawLevel = gboBuf[50]; // Получаем сырое значение (сейчас там 42)
+        // Неоходимо проверить физическое подключение, т.к. уровень газа на кнопке не работает
+        //byte rawLevel = gboBuf[неизвестно]; // Получаем сырое значение (сейчас там 42)
         // Переводим попугаи датчика (считаем, что пустой ~40, полный ~210) в реальные литры (от 0 до 48)
         // !!!!!Внимание: точные цифры 40 и 210 НУЖНО скорректировать, когда баллон будет полностью пустой!!!!!
-        gasLiters = map(rawLevel, 40, 210, 0, 48); 
-        if (gasLiters < 0) gasLiters = 0;
-        if (gasLiters > 48) gasLiters = 48;
+        //gasLiters = map(rawLevel, 40, 210, 0, 48); 
+        //if (gasLiters < 0) gasLiters = 0;
+        //if (gasLiters > 48) gasLiters = 48;
+
+        // лямбда1 и лямбда2 неизвестно
+
+        // Бортовое напряжение (Батарея)
+        //batteryVolt = gboBuf[неизвестно]*0.01 + 12.0;
 
         // ВЫВОД НА ПРИБОРКУ
         printToDashboard();
@@ -115,15 +131,20 @@ void loop() {
 void printToDashboard() {
   Serial.print(F("[ГБО] Топливо: "));
   if (isGasActive) Serial.print(F("ГАЗ")); else Serial.print(F("БЕНЗИН"));
-  
   Serial.print(F(" | Обороты: ")); Serial.print(engineRpm);
-  Serial.print(F(" | Впр_Бенз: ")); Serial.print(injBenz, 1); Serial.print(F("мс"));
-  Serial.print(F(" | Впр_Газ: ")); Serial.print(injGas, 1); Serial.print(F("мс"));
-  Serial.print(F(" | П_Газ: ")); Serial.print(pressGas, 2);
-  Serial.print(F(" | П_MAP: ")); Serial.print(pressMap, 2);
+  Serial.print(F(" | Впр_Бенз: ")); Serial.print(injBenz1, 1);
+  Serial.print(F(" | ")); Serial.print(injBenz2, 1);
+  Serial.print(F(" | ")); Serial.print(injBenz3, 1);
+  Serial.print(F(" | ")); Serial.print(injBenz4, 1); Serial.print(F(" мс"));
+  Serial.print(F(" | Впр_Газ: ")); Serial.print(injGas1, 1); 
+  Serial.print(F(" | ")); Serial.print(injGas2, 1); 
+  Serial.print(F(" | ")); Serial.print(injGas3, 1);
+  Serial.print(F(" | ")); Serial.print(injGas4, 1); Serial.print(F(" мс"));
+  Serial.print(F(" | Давл_Газ: ")); Serial.print(pressGas, 2);
+  Serial.print(F(" | Давл_MAP: ")); Serial.print(pressMap, 2);
   Serial.print(F(" | Т_Ред: ")); Serial.print(tempRed); Serial.print(F("°C"));
   Serial.print(F(" | Т_Газ: ")); Serial.print(tempGas); Serial.print(F("°C"));
-  Serial.print(F(" | Остаток газа: ")); Serial.print(gasLiters); Serial.print(F(" л "));
+  Serial.print(F(" | Ост_газа: ")); Serial.print(gasLiters); Serial.print(F(" л "));
   Serial.println(F(")"));
 }
 
