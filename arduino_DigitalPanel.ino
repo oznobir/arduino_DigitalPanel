@@ -84,16 +84,16 @@ void loop() {
             // 1. Параллельно выхватываем пакеты из CAN-шины, чтобы буфер MCP2515 не переполнялся!
             long unsigned int rxId;
             unsigned char len = 0;
-            unsigned char rxBuf;
+            unsigned char rxBuf[8];
             if(CAN0.checkReceive() == CAN_MSGAVAIL) { 
               CAN0.readMsgBuf(&rxId, &len, rxBuf);    
               if (rxId == 0x11A) {
-                int rawRpm = (rxBuf[0] << 8) | rxBuf[1];
+                int rawRpm = (rxBuf[1] << 8) | rxBuf[0];
                 carRpm = rawRpm / 4;
                 carWaterTemp = rxBuf[4] - 40;
               }
               if (rxId == 0x354) {
-                int rawSpeed = (rxBuf[0] << 8) | rxBuf[1];
+                int rawSpeed = (rxBuf[5] << 8) | rxBuf[4];
                 carSpeed = rawSpeed / 100.0;
               }
             }
