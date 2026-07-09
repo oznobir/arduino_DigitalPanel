@@ -78,7 +78,7 @@ void loop() {
       // Разбор ответа по температуре ОЖ
       else if (rxBuf[2] == 0x05 && rxBuf[4] == 0x42) {
         dashData.coolantTemp = rxBuf[3] - 40; // Формула температуры
-        dashData.voltage = ((rxBuf[3] * 256) + rxBuf[4]); // Формула OBD2: ((A * 256) + B) / 1000
+        dashData.voltage = ((rxBuf[5] * 256) + rxBuf[6]); // Формула OBD2: ((A * 256) + B) / 1000
       }
       
       Serial.print(F("[CAN] Обороты: ")); Serial.print(dashData.rpm); Serial.print(F(" об/мин"));
