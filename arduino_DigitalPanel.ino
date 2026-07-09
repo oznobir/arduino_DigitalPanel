@@ -7,11 +7,29 @@ const int CAN_CS_PIN = 53;  // Пин CS для MCP2515 (на Arduino Mega)
 MCP_CAN CAN0(CAN_CS_PIN);  // Инициализация объекта CAN
 
 // Настройка и переменные для OBD2
-unsigned long lastCanRequest = 0;
-const unsigned long canInterval = 150;  // Будем запрашивать данные из OBD2
-int obdRpm = 0;                         // Сюда сохраним обороты от машины
-// Строка запроса оборотов (RPM) по стандарту OBD2
-byte obdQuery[8] = { 0x02, 0x01, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00 };
+unsigned long lastFastQuery = 0;
+unsigned long lastSlowQuery = 0;
+
+// Структура RealDash (обязательно 4-байтовое выравнивание)
+#pragma pack(push, 1)
+struct RealDashPacket {
+  unsigned long header = 0x44415348; // Маркер "DASH"
+  // Скоростные параметры с CAN машины
+  uint16_t rpm = 0;
+  uint16_t speed = 0;
+  // Медленные параметры с CAN машины
+  uint16_t coolantTemp = 0;
+  uint16_t voltage = 0;
+};
+#pragma pack(pop)
+
+RealDashPacket dashData;
+
+byte slowStep = 0; // Очередь для медленных параметров
+// 0x03 (длина), 0x01 (режим), 0x0C (RPM), 0x0D (Speed)
+byte queryFast[8] = { 0x03, 0x01, 0x0C, 0x0D, 0x00, 0x00, 0x00, 0x00 };
+ // 0x03 (длина), 0x01 (режим), 0x05 (Температура ОЖ), 0x42 (вольт)
+byte queryCoolant[8] = { 0x03, 0x01, 0x05, 0x42, 0x00, 0x00, 0x00, 0x00 };
 
 void setup() {
   Serial.begin(115200);  // Скорость Монитора порта — 115200 (* 16/12 = 153600)
@@ -28,21 +46,18 @@ void setup() {
 
 void loop() {
   // === ОПРОС CAN-ШИНЫ (MCP2515) ===
-  // 1. Отправка запроса в OBD2 по таймеру
-  if (millis() - lastCanRequest >= canInterval) {
-    lastCanRequest = millis();
-
-    // Отправляем 8 байт запроса на ID 0x7E0 (стандартный ID моторного блока)
-    // Параметры: ID, тип кадра (0 - стандартный), длина (8 байт), массив данных
-    byte sndStat = CAN0.sendMsgBuf(0x7E0, 0, 8, obdQuery);
-
-    if (sndStat == CAN_OK) {
-      Serial.println(F("[OBD2] Запрос RPM отправлен!"));
-    } else {
-      Serial.println(F("[OBD2] Ошибка отправки запроса в шину. Проверьте провода!"));
-    }
+  unsigned long currentMillis = millis();
+  // 1. БЫСТРЫЙ ЗАПРОС (Обороты + Скорость) - каждые 80 мс
+  if (currentMillis - lastFastQuery >= 80) {
+    lastFastQuery = currentMillis;
+    CAN0.sendMsgBuf(0x7E0, 0, 8, queryFast); // 0x7E0 - ID запроса к ЭБУ Continental
   }
-  // 2. Ожидание и чтение ответа от машины
+  // 2. МЕДЛЕННЫЙ ЗАПРОС (Температура ОЖ) - каждые 2000 мс
+  if (currentMillis - lastSlowQuery >= 2000) {
+    lastSlowQuery = currentMillis;
+    CAN0.sendMsgBuf(0x7E0, 0, 8, queryCoolant);
+   }
+  // ==== Ожидание и чтение ответа от машины =======
   //
   if (CAN0.checkReceive() == CAN_MSGAVAIL) {
     long unsigned int rxId;
@@ -51,23 +66,27 @@ void loop() {
 
     // Вычитываем пакет из MCP2515
     CAN0.readMsgBuf(&rxId, &len, rxBuf);
-
-    // Нам интересен строго ответ от моторного блока (ID 0x7E8)
-    if (rxId == 0x7E8) {
-      // Проверяем, что это ответ на наш запрос (режим 0x41, PID 0x0C)
-      if (rxBuf[1] == 0x41 && rxBuf[2] == 0x0C) {
-
-        // Формула перевода сырых байт OBD2 в реальные обороты двигателя:
-        // Обороты = ((БайтA * 256) + БайтB) / 4
-        int byteA = rxBuf[3];
-        int byteB = rxBuf[4];
-        obdRpm = ((byteA * 256) + byteB) / 4;
-
-        Serial.print(F("[CAN] Блок ответил! Обороты мотора: "));
-        Serial.print(obdRpm);
-        Serial.println(F(" об/мин"));
+    // Проверяем, что ответил именно ЭБУ двигателя (0x7E8) и это ответ на OBD2 (0x41)
+    if (rxId == 0x7E8 && rxBuf[1] == 0x41) {
+      
+      // Разбор мульти-ответа (Обороты + Скорость)
+      if (rxBuf[2] == 0x0C && rxBuf[5] == 0x0D) {
+        dashData.rpm = ((rxBuf[3] * 256) + rxBuf[4]) / 4; // Формула RPM
+        dashData.speed = rxBuf[6];                        // Скорость напрямую в км/ч
       }
+      
+      // Разбор ответа по температуре ОЖ
+      else if (rxBuf[2] == 0x05 && rxBuf[4] == 0x42) {
+        dashData.coolantTemp = rxBuf[3] - 40; // Формула температуры
+        dashData.voltage = ((rxBuf[3] * 256) + rxBuf[4]); // Формула OBD2: ((A * 256) + B) / 1000
+      }
+      
+      Serial.print(F("[CAN] Обороты: ")); Serial.print(dashData.rpm); Serial.print(F(" об/мин"));
+      Serial.print(F(" | Скорость: ")); Serial.print(dashData.speed); Serial.println(F(" км/ч"));
+      Serial.print(F(" | Батарея: ")); Serial.print((dashData.voltage / 1000), 2); Serial.println(F(" в"));
+      Serial.print(F(" | Температура: ")); Serial.print(dashData.coolantTemp); Serial.println(F(" С"));
     }
+
   }
 }
 
