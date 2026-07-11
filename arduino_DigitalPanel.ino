@@ -28,8 +28,10 @@ RealDashPacket dashData;
 byte slowStep = 0; // Очередь для медленных параметров
 // 0x03 (длина), 0x01 (режим), 0x0C (RPM), 0x0D (Speed)
 byte queryFast[8] = { 0x03, 0x01, 0x0C, 0x0D, 0x00, 0x00, 0x00, 0x00 };
- // 0x03 (длина), 0x01 (режим), 0x05 (Температура ОЖ), 0x42 (вольт)
-byte queryCoolant[8] = { 0x03, 0x01, 0x05, 0x42, 0x00, 0x00, 0x00, 0x00 };
+// 0x03 (длина), 0x01 (режим), 0x05 (Температура ОЖ), 0x42 (вольт)
+//byte queryCoolant[8] = { 0x03, 0x01, 0x05, 0x42, 0x00, 0x00, 0x00, 0x00 };
+byte queryCoolantOnly[8] = { 0x02, 0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00 };
+byte queryVoltOnly[8] = { 0x02, 0x01, 0x42, 0x00, 0x00, 0x00, 0x00, 0x00 };
 
 void setup() {
   Serial.begin(115200);  // Скорость Монитора порта — 115200 (* 16/12 = 153600)
@@ -48,15 +50,31 @@ void loop() {
   // === ОПРОС CAN-ШИНЫ (MCP2515) ===
   unsigned long currentMillis = millis();
   // 1. БЫСТРЫЙ ЗАПРОС (Обороты + Скорость) - каждые 80 мс
-  if (currentMillis - lastFastQuery >= 80) {
+  if (currentMillis - lastFastQuery >= 300) {
     lastFastQuery = currentMillis;
     CAN0.sendMsgBuf(0x7E0, 0, 8, queryFast); // 0x7E0 - ID запроса к ЭБУ Continental
   }
   // 2. МЕДЛЕННЫЙ ЗАПРОС (Температура ОЖ) - каждые 2000 мс
-  if (currentMillis - lastSlowQuery >= 2000) {
+  // if (currentMillis - lastSlowQuery >= 2000) {
+  //   lastSlowQuery = currentMillis;
+  //   CAN0.sendMsgBuf(0x7E0, 0, 8, queryCoolant);
+  //  }
+  if (currentMillis - lastSlowQuery >= 1000) {
     lastSlowQuery = currentMillis;
-    CAN0.sendMsgBuf(0x7E0, 0, 8, queryCoolant);
-   }
+  
+    if (slowStep == 0) {
+    // Шлем чистый запрос только температуры ОЖ (длина 0x02, PID 0x05)
+      byte queryCoolantOnly[8] = { 0x02, 0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00 };
+      CAN0.sendMsgBuf(0x7E0, 0, 8, queryCoolantOnly);
+      slowStep = 1; // В следующий раз запросим вольтметр
+    } else {
+      // CAN0.sendMsgBuf(0x7E0, 0, 8, queryVoltOnly);
+      CAN0.sendMsgBuf(0x7E1, 0, 8, queryVoltOnly); // Отправляем в ABS!
+      slowStep = 0; // Возвращаемся к температуре
+    }
+  }
+
+
   // ==== Ожидание и чтение ответа от машины =======
   //
   if (CAN0.checkReceive() == CAN_MSGAVAIL) {
@@ -71,25 +89,56 @@ void loop() {
       
       // Разбор мульти-ответа (Обороты + Скорость)
       if (rxBuf[2] == 0x0C && rxBuf[5] == 0x0D) {
-        dashData.rpm = ((rxBuf[3] * 256) + rxBuf[4]) / 4; // Формула RPM
+        dashData.rpm = (((uint16_t)rxBuf[3] * 256) + rxBuf[4]) / 4; // Формула RPM
         dashData.speed = rxBuf[6];                        // Скорость напрямую в км/ч
       }
-      
-      // Разбор ответа по температуре ОЖ
-      else if (rxBuf[2] == 0x05 && rxBuf[4] == 0x42) {
-        dashData.coolantTemp = rxBuf[3] - 40; // Формула температуры
-        dashData.voltage = ((rxBuf[5] * 256) + rxBuf[6]); // Формула OBD2: ((A * 256) + B) / 1000
+      // ИСПРАВЛЕНО: Разбор одиночного ответа на Температуру ОЖ
+      // Ответ прилетит в виде: 03 41 05 [Значение] 00 00 00 00
+      else if (rxBuf[2] == 0x05) {
+        dashData.coolantTemp = rxBuf[3];
       }
-      
-      Serial.print(F("[CAN] Обороты: ")); Serial.print(dashData.rpm); Serial.print(F(" об/мин"));
-      Serial.print(F(" | Скорость: ")); Serial.print(dashData.speed); Serial.println(F(" км/ч"));
-      Serial.print(F(" | Батарея: ")); Serial.print((dashData.voltage / 1000), 2); Serial.println(F(" в"));
-      Serial.print(F(" | Температура: ")); Serial.print(dashData.coolantTemp); Serial.println(F(" С"));
+    
+      // ИСПРАВЛЕНО: Разбор одиночного ответа на Вольтаж
+      // Ответ прилетит в виде: 04 41 42 [High] [Low] 00 00 00
+      else if (rxBuf[2] == 0x42) {
+        Serial.print(F(" -> ОТВЕТ НА ВОЛЬТ [RAW]: "));
+        for (int i = 0; i < 8; i++) {
+          if(rxBuf[i] < 0x10) Serial.print("0");
+          Serial.print(rxBuf[i], HEX); Serial.print(" ");
+        }
+        Serial.println();
+        dashData.voltage = ((uint16_t)rxBuf[3] * 256) + rxBuf[4]; 
+      }
+      // ИСПРАВЛЕНИЕ ПОД ТЕСТ: Для любого другого ответа выводим СЫРЫЕ БАЙТЫ в HEX
+      // else {
+      //   Serial.print(F("ОТВЕТ ОТ ЭБУ [RAW]: "));
+      //   for (int i = 0; i < len; i++) {
+      //     if (rxBuf[i] < 0x10) Serial.print("0"); // Добавляем ноль для красоты
+      //     Serial.print(rxBuf[i], HEX);
+      //     Serial.print(" ");
+      //   }
+      //   Serial.println();
+      // }
+      // // Разбор ответа по температуре ОЖ
+      // if (rxBuf[2] == 0x05 && rxBuf[4] == 0x42) {
+      //   dashData.coolantTemp = rxBuf[3]; // Формула температуры А - 40
+      //   dashData.voltage = (((uint16_t)rxBuf[6] * 256) + rxBuf[7]); // Формула вольтажа: ((A * 256) + B) / 1000
+      // }
     }
-
+    else if (rxId == 0x7E9 && rxBuf[1] == 0x41) {
+       if (rxBuf[2] == 0x42) {
+          // Собираем стандартный двухбайтовый вольтаж ABS
+          dashData.voltage = ((uint16_t)rxBuf[3] * 256) + rxBuf[4]; 
+        }
+    }
+    Serial.print(F("[CAN] Обороты: ")); Serial.print(dashData.rpm); Serial.print(F(" об/мин"));
+    Serial.print(F(" | Скорость: ")); Serial.print(dashData.speed); Serial.print(F(" км/ч"));
+    Serial.print(F(" | Батарея: ")); Serial.print((dashData.voltage / 1000.0), 2); Serial.print(F(" в"));
+    Serial.print(F(" | Температура: ")); Serial.print(dashData.coolantTemp - 40); Serial.println(F(" °C"));
+    
   }
 }
-
+// //-----------------------------------------------------------------------------------------------------
 // #include <SPI.h>
 // #include <mcp_can.h>
 
@@ -134,3 +183,6 @@ void loop() {
 //     //}
 //   }
 // }
+
+
+//<value targetId="14" offset="8" length="2" signed="false" conversion="V-100"></value>
