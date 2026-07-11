@@ -1,188 +1,170 @@
-#include <SPI.h>
-#include <mcp_can.h>
+#include <Arduino.h>
 
+// --- КОНФИГУРАЦИЯ ПИНОВ ---
+const byte SPEED_PIN = 2;   // Пин прерывания (Пин 2 = INT 0 на Mega). Сюда подключаем скорость через делитель.
+const byte VOLT_PIN = A0;   // Аналоговый пин вольтметра (через делитель 10к/4.7к)
+const byte COOLANT_PIN = A1;// Аналоговый пин ТОЖ (через делитель 10к/4.7к)
+const byte FUEL_PIN = A2;   // Аналоговый пин датчика уровня топлива (через делитель 10к/4.7к)
+const byte RPM_PIN = 3;     // Пин прерывания тахометра (Пин 3 = INT 1 на Mega)
 
-// --- КОНФИГУРАЦИЯ CAN-МОДУЛЯ ---
-const int CAN_CS_PIN = 53;  // Пин CS для MCP2515 (на Arduino Mega)
-MCP_CAN CAN0(CAN_CS_PIN);  // Инициализация объекта CAN
+// Переменные для расчета оборотов по импульсам
+volatile unsigned long rpmPulseCount = 0;
+unsigned long lastRpmCheck = 0;
+const unsigned long RPM_INTERVAL = 200; // Обороты обновляем чаще (раз в 200 мс) для плавности стрелки
 
-// Настройка и переменные для OBD2
-unsigned long lastFastQuery = 0;
-unsigned long lastSlowQuery = 0;
+// Переменные для расчета скорости по импульсам
+volatile unsigned long speedPulseCount = 0;
+unsigned long lastSpeedCheck = 0;
+const unsigned long SPEED_INTERVAL = 500; // Проверяем скорость раз в 500 мс
+
+// Таймер для отправки данных в RealDash
+unsigned long lastRealDashSend = 0;
 
 // Структура RealDash (обязательно 4-байтовое выравнивание)
 #pragma pack(push, 1)
 struct RealDashPacket {
   unsigned long header = 0x44415348; // Маркер "DASH"
-  // Скоростные параметры с CAN машины
-  uint16_t rpm = 0;
+  // Аналоговые параметры и импульсы (считает сама Ардуино)
   uint16_t speed = 0;
-  // Медленные параметры с CAN машины
-  uint16_t coolantTemp = 0;
+  uint16_t rpm = 0;
   uint16_t voltage = 0;
+  uint16_t fuelLevel = 0;
+  uint16_t coolantTemp = 0;
+  // Параметры от ГБО Stag (принимаем по Serial)
+  uint16_t rpmGbo = 0;
 };
 #pragma pack(pop)
 
 RealDashPacket dashData;
 
-byte slowStep = 0; // Очередь для медленных параметров
-// 0x03 (длина), 0x01 (режим), 0x0C (RPM), 0x0D (Speed)
-byte queryFast[8] = { 0x03, 0x01, 0x0C, 0x0D, 0x00, 0x00, 0x00, 0x00 };
-// 0x03 (длина), 0x01 (режим), 0x05 (Температура ОЖ), 0x42 (вольт)
-//byte queryCoolant[8] = { 0x03, 0x01, 0x05, 0x42, 0x00, 0x00, 0x00, 0x00 };
-byte queryCoolantOnly[8] = { 0x02, 0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00 };
-byte queryVoltOnly[8] = { 0x02, 0x01, 0x42, 0x00, 0x00, 0x00, 0x00, 0x00 };
+// Функция обработки импульса оборотов (вызывается аппаратно)
+void onRpmPulse() {
+  rpmPulseCount++;
+}
+// --- Функция обработки импульса скорости (вызывается аппаратно) ---
+void onSpeedPulse() {
+  speedPulseCount++;
+}
 
 void setup() {
-  Serial.begin(115200);  // Скорость Монитора порта — 115200 (* 16/12 = 153600)
-  while (!Serial);  // Ожидание открытия Монитора порта
-  // Инициализация CAN (с использованием F() макроса для экономии памяти)
-  Serial.println(F("=== ИНИЦИАЛИЗАЦИЯ CAN-МОДУЛЯ ==="));
-  if (CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) == CAN_OK) {
-    Serial.println(F("=== MCP2515 успешно запущен! ==="));
-    CAN0.setMode(MCP_NORMAL);  // Режим пассивного прослушивания/работы
-  } else {
-    Serial.println(F("=== Ошибка инициализации MCP2515! ==="));
-  }
+  // Настраиваем порты
+  Serial.begin(115200);   // Порт для связи с RealDash (основной USB)
+  Serial1.begin(9600);    // Порт Serial1 (пины 19-RX, 18-TX) под ГБО Stag
+  pinMode(SPEED_PIN, INPUT);
+  // Привязываем прерывание: ловим переход сигнала из 0 в 1 (RISING)
+  attachInterrupt(digitalPinToInterrupt(SPEED_PIN), onSpeedPulse, RISING);
+  pinMode(RPM_PIN, INPUT);
+  // Привязываем второе прерывание для оборотов (по фронту RISING)
+  attachInterrupt(digitalPinToInterrupt(RPM_PIN), onRpmPulse, RISING);
 }
 
 void loop() {
-  // === ОПРОС CAN-ШИНЫ (MCP2515) ===
   unsigned long currentMillis = millis();
-  // 1. БЫСТРЫЙ ЗАПРОС (Обороты + Скорость) - каждые 80 мс
-  if (currentMillis - lastFastQuery >= 300) {
-    lastFastQuery = currentMillis;
-    CAN0.sendMsgBuf(0x7E0, 0, 8, queryFast); // 0x7E0 - ID запроса к ЭБУ Continental
-  }
-  // 2. МЕДЛЕННЫЙ ЗАПРОС (Температура ОЖ) - каждые 2000 мс
-  // if (currentMillis - lastSlowQuery >= 2000) {
-  //   lastSlowQuery = currentMillis;
-  //   CAN0.sendMsgBuf(0x7E0, 0, 8, queryCoolant);
-  //  }
-  if (currentMillis - lastSlowQuery >= 1000) {
-    lastSlowQuery = currentMillis;
-  
-    if (slowStep == 0) {
-    // Шлем чистый запрос только температуры ОЖ (длина 0x02, PID 0x05)
-      byte queryCoolantOnly[8] = { 0x02, 0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00 };
-      CAN0.sendMsgBuf(0x7E0, 0, 8, queryCoolantOnly);
-      slowStep = 1; // В следующий раз запросим вольтметр
-    } else {
-      // CAN0.sendMsgBuf(0x7E0, 0, 8, queryVoltOnly);
-      CAN0.sendMsgBuf(0x7E1, 0, 8, queryVoltOnly); // Отправляем в ABS!
-      slowStep = 0; // Возвращаемся к температуре
-    }
-  }
+  // 1. РАСЧЕТ ОБОРОТОВ ДВИГАТЕЛЯ (Раз в 200 мс)
+  if (currentMillis - lastRpmCheck >= RPM_INTERVAL) {
+    noInterrupts();
+    unsigned long rpmPulses = rpmPulseCount;
+    rpmPulseCount = 0;
+    interrupts();
 
-
-  // ==== Ожидание и чтение ответа от машины =======
-  //
-  if (CAN0.checkReceive() == CAN_MSGAVAIL) {
-    long unsigned int rxId;
-    unsigned char len = 0;
-    unsigned char rxBuf[8];  // Буфер под 8 байт ответа OBD2
-
-    // Вычитываем пакет из MCP2515
-    CAN0.readMsgBuf(&rxId, &len, rxBuf);
-    // Проверяем, что ответил именно ЭБУ двигателя (0x7E8) и это ответ на OBD2 (0x41)
-    if (rxId == 0x7E8 && rxBuf[1] == 0x41) {
-      
-      // Разбор мульти-ответа (Обороты + Скорость)
-      if (rxBuf[2] == 0x0C && rxBuf[5] == 0x0D) {
-        dashData.rpm = (((uint16_t)rxBuf[3] * 256) + rxBuf[4]) / 4; // Формула RPM
-        dashData.speed = rxBuf[6];                        // Скорость напрямую в км/ч
-      }
-      // ИСПРАВЛЕНО: Разбор одиночного ответа на Температуру ОЖ
-      // Ответ прилетит в виде: 03 41 05 [Значение] 00 00 00 00
-      else if (rxBuf[2] == 0x05) {
-        dashData.coolantTemp = rxBuf[3];
-      }
+    // По стандарту Renault/Nissan, ЭБУ выдает 2 импульса на 1 оборот коленвала (для 4-цилиндрового мотора)
+    // Обороты (об/мин) = (импульсы / время в сек) * (60 сек / 2 импульса)
+    // Для интервала 200 мс (0.2 сек) формула: (pulses / 0.2) * 30 -> pulses * 150
+    float calculatedRpm = (rpmPulses / (RPM_INTERVAL / 1000.0)) * 30.0;
     
-      // ИСПРАВЛЕНО: Разбор одиночного ответа на Вольтаж
-      // Ответ прилетит в виде: 04 41 42 [High] [Low] 00 00 00
-      else if (rxBuf[2] == 0x42) {
-        Serial.print(F(" -> ОТВЕТ НА ВОЛЬТ [RAW]: "));
-        for (int i = 0; i < 8; i++) {
-          if(rxBuf[i] < 0x10) Serial.print("0");
-          Serial.print(rxBuf[i], HEX); Serial.print(" ");
-        }
-        Serial.println();
-        dashData.voltage = ((uint16_t)rxBuf[3] * 256) + rxBuf[4]; 
-      }
-      // ИСПРАВЛЕНИЕ ПОД ТЕСТ: Для любого другого ответа выводим СЫРЫЕ БАЙТЫ в HEX
-      // else {
-      //   Serial.print(F("ОТВЕТ ОТ ЭБУ [RAW]: "));
-      //   for (int i = 0; i < len; i++) {
-      //     if (rxBuf[i] < 0x10) Serial.print("0"); // Добавляем ноль для красоты
-      //     Serial.print(rxBuf[i], HEX);
-      //     Serial.print(" ");
-      //   }
-      //   Serial.println();
-      // }
-      // // Разбор ответа по температуре ОЖ
-      // if (rxBuf[2] == 0x05 && rxBuf[4] == 0x42) {
-      //   dashData.coolantTemp = rxBuf[3]; // Формула температуры А - 40
-      //   dashData.voltage = (((uint16_t)rxBuf[6] * 256) + rxBuf[7]); // Формула вольтажа: ((A * 256) + B) / 1000
-      // }
-    }
-    else if (rxId == 0x7E9 && rxBuf[1] == 0x41) {
-       if (rxBuf[2] == 0x42) {
-          // Собираем стандартный двухбайтовый вольтаж ABS
-          dashData.voltage = ((uint16_t)rxBuf[3] * 256) + rxBuf[4]; 
-        }
-    }
-    Serial.print(F("[CAN] Обороты: ")); Serial.print(dashData.rpm); Serial.print(F(" об/мин"));
-    Serial.print(F(" | Скорость: ")); Serial.print(dashData.speed); Serial.print(F(" км/ч"));
-    Serial.print(F(" | Батарея: ")); Serial.print((dashData.voltage / 1000.0), 2); Serial.print(F(" в"));
-    Serial.print(F(" | Температура: ")); Serial.print(dashData.coolantTemp - 40); Serial.println(F(" °C"));
-    
+    dashData.rpm = (uint16_t)calculatedRpm;
+    lastRpmCheck = currentMillis;
   }
+  // 2. РАСЧЕТ СКОРОСТИ АВТОМОБИЛЯ (Раз в 500 мс)
+  if (currentMillis - lastSpeedCheck >= SPEED_INTERVAL) {
+    // Временно отключаем прерывания, чтобы безопасно считать переменную pulseCount
+    noInterrupts();
+    unsigned long pulses = speedPulseCount;
+    speedPulseCount = 0;
+    interrupts();
+
+    // Формула для платформы B0 (Logan/Almera G15): Датчик дает ровно 6 импульсов на 1 метр пути.
+    // Скорость (км/ч) = (импульсы / время в сек) * (3600 сек / 6000 импульсов в 1 км)
+    // Для интервала 500 мс (0.5 сек) формула упрощается до: pulses * 1.2
+    float calculatedSpeed = (pulses / (SPEED_INTERVAL / 1000.0)) * 0.6;
+    
+    dashData.speed = (uint16_t)calculatedSpeed;
+    lastSpeedCheck = currentMillis;
+  }
+
+  // 3. ЧТЕНИЕ ДАННЫХ ОТ ГБО STAG (Через Serial1)
+  if (Serial1.available()) {
+    // Здесь должен быть готовый код разбора пакета Stag
+  }
+
+  // 4. ИЗМЕРЕНИЕ ВОЛЬТАЖА, ТОПЛИВА И ТОЖ (Раз в 200 мс, чтобы не спамить АЦП)
+  static unsigned long lastAnalogRead = 0;
+  if (currentMillis - lastAnalogRead >= 200) {
+    lastAnalogRead = currentMillis;
+
+    // Вольтметр бортовой сети (Делитель 10кОм и 4.7кОм)
+    int rawVolt = analogRead(VOLT_PIN);
+    float realVoltage = (rawVolt * 5.0 / 1023.0) * 3.1276; // 3.1276 — коэффициент делителя
+    dashData.voltage = (uint16_t)(realVoltage * 1000.0);   // Переводим в формат V/1000 для RealDash
+
+    // Уровень топлива (ДУТ Logan/Almera: полный бак ~30 Ом, пустой ~330 Ом)
+    int rawFuel = analogRead(FUEL_PIN);
+    // Калибровка ДУТ: преобразуем сырое напряжение АЦП сразу в литры (от 0 до 50)
+    // map(значение, пустой_значение_АЦП, полный_значение_АЦП, 0 литров, 50 литров)
+    // Точные значения АЦП для пустого и полного бака нужно настроить при калибровке на машине
+    long liters = map(rawFuel, 800, 100, 0, 50); 
+    if (liters < 0) liters = 0;
+    if (liters > 50) liters = 50;
+    dashData.fuelLevel = (uint16_t)liters;
+    // Чтение аналоговой температуры ОЖ (Пин А1)
+    int rawCoolant = analogRead(COOLANT_PIN);
+    // Калибровка ДТОЖ: преобразуем вольты АЦП в реальные градусы
+    // Примерные значения: 900 на АЦП — это холодный мотор (около 20°C), 
+    // 150 на АЦП — это горячий прогретый мотор (около 90°C).
+    // Точные значения АЦП нужно подогонать на машине по датчику ГБО Stag для калибровки!
+    long exactDeg = map(rawCoolant, 900, 150, 20, 90);
+    // Записываем в структуру со смещением +40 (для XML)
+    dashData.coolantTemp = (uint16_t)(exactDeg + 40);
+  }
+  // 5. ОТПРАВКА СТРУКТУРЫ В МОНИТОР ПОРТА (Каждые 30 мс)
+  if (currentMillis - lastRealDashSend >= 1000) {
+    lastRealDashSend = currentMillis;
+    printDashboard(dashData);
+  }
+  // // 5. ОТПРАВКА СТРУКТУРЫ В REALDASH (Каждые 30 мс)
+  // if (currentMillis - lastRealDashSend >= 30) {
+  //   lastRealDashSend = currentMillis;
+  //   Serial.write((byte*)&dashData, sizeof(dashData));
+  // }
 }
-// //-----------------------------------------------------------------------------------------------------
-// #include <SPI.h>
-// #include <mcp_can.h>
-
-// const int SPI_CS_PIN = 53;
-// MCP_CAN CAN0(SPI_CS_PIN);
-
-// void setup() {
-//   Serial.begin(115200);
+void printDashboard(const RealDashPacket& dataPacket) {
+  Serial.print(F("[Аналог] Скорость: ")); Serial.print(dataPacket.speed); Serial.print(F(" км/ч"));
+  Serial.print(F(" | Обороты: ")); Serial.print(dataPacket.rpm);
+  Serial.print(F(" | ТОЖ: ")); Serial.print(dataPacket.coolantTemp); Serial.print(F("°C"));
+  Serial.print(F(" | Батарея: ")); Serial.print(dataPacket.voltage); Serial.print(F(" в"));
+  Serial.print(F(" | Бензин: ")); Serial.print(dataPacket.fuelLevel); Serial.println(F(" л"));
   
-//   // Внимание: если кварц на MCP2515 равен 16МГц - поменяйте ниже на MCP_16MHZ!
-//   if(CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) == CAN_OK) {
-//     Serial.println(F("=== СКАНЕР CAN-ШИНЫ ALMERA G15 ЗАПУЩЕН ==="));
-//     CAN0.setMode(MCP_LISTENONLY); // Включаем пассивный режим шпиона
-//   } else {
-//     Serial.println(F("Ошибка инициализации MCP2515!"));
-//   }
-// }
-
-// void loop() {
-//   long unsigned int rxId;
-//   unsigned char len = 0;
-//   unsigned char rxBuf[8];
-
-//   if(CAN0.checkReceive() == CAN_MSGAVAIL) {
-//     CAN0.readMsgBuf(&rxId, &len, rxBuf);
+  Serial.print(F("[ГБО] Газ_Обороты: ")); Serial.print(dataPacket.rpmGbo);
+}
+// <?xml version="1.0" encoding="utf-8"?>
+// <realdash>
+//   <data baseId="3200">
+//     <!-- Маркер DASH занимает первые 4 байта (offset 0, 1, 2, 3) -->
     
-//     // Выводим только пассивные пакеты машины (игнорируем длинные ответы OBD 0x7E8)
-//     //if (rxId < 0x700) { 
-//       Serial.print(F("ID: 0x"));
-//       Serial.print(rxId, HEX);
-//       Serial.print(F(" | Длина: "));
-//       Serial.print(len);
-//       Serial.print(F(" | Данные: "));
-      
-//       for(int i = 0; i<len; i++) {
-//         Serial.print(F("0x"));
-//         if(rxBuf[i] < 16) Serial.print(F("0"));
-//         Serial.print(rxBuf[i], HEX);
-//         Serial.print(F(" "));
-//       }
-//       Serial.println();
-//     //}
-//   }
-// }
+//     <!-- Скорость: смещение 4, длина 2 -->
+//     <value targetId="0" offset="4" length="2" signed="false"></value>
+    
+//     <!-- Вольтметр: смещение 6, длина 2 (RealDash сам разделит на 1000) -->
+//     <value targetId="12" offset="6" length="2" signed="false" conversion="V/1000"></value>
+    
+//     <!-- Уровень топлива: смещение 8, длина 2 (уже сразу в литрах) -->
+//     <value targetId="18" offset="8" length="2" signed="false"></value>
+    
+//     <!-- Обороты от Stag: смещение 10, длина 2 -->
+//     <value targetId="1" offset="10" length="2" signed="false"></value>
+    
+//     <!-- Температура Редуктора от Stag: смещение 12, длина 2 (вычитаем 40 для смещения) -->
+//     <value targetId="14" offset="12" length="2" signed="false" conversion="V-40"></value>
+//   </data>
+// </realdash>
 
-
-//<value targetId="14" offset="8" length="2" signed="false" conversion="V-100"></value>
