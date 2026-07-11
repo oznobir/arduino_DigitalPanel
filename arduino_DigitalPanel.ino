@@ -140,8 +140,8 @@ void loop() {
 void printDashboard(const RealDashPacket& dataPacket) {
   Serial.print(F("[Аналог] Скорость: ")); Serial.print(dataPacket.speed); Serial.print(F(" км/ч"));
   Serial.print(F(" | Обороты: ")); Serial.print(dataPacket.rpm);
-  Serial.print(F(" | ТОЖ: ")); Serial.print(dataPacket.coolantTemp); Serial.print(F("°C"));
-  Serial.print(F(" | Батарея: ")); Serial.print(dataPacket.voltage); Serial.print(F(" в"));
+  Serial.print(F(" | ТОЖ: ")); Serial.print(dataPacket.coolantTemp - 40); Serial.print(F("°C"));
+  Serial.print(F(" | Батарея: ")); Serial.print((dataPacket.voltage / 1000), 2); Serial.print(F(" в"));
   Serial.print(F(" | Бензин: ")); Serial.print(dataPacket.fuelLevel); Serial.println(F(" л"));
   
   Serial.print(F("[ГБО] Газ_Обороты: ")); Serial.print(dataPacket.rpmGbo);
