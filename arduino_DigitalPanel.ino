@@ -1,100 +1,111 @@
 #include <Arduino.h>
-// --- НАСТРОЙКА ПИНОВ (КОНФИГУРАЦИЯ ЖЕЛЕЗА) ---
-const int PIN_DOOR_TRIGGER = 2; // Вход: Импульс от концевика двери или ЦЗ
-const int PIN_IGNITION     = 3; // Вход: Контроль Клеммы 15 (Зажигание машины)
-const int PIN_ACC_OUTPUT   = 4; // Выход: Управление ключом PROFET (Красный провод магнитолы)
-const int PIN_HOLD_POWER   = 5; // Выход: Самоудержание питания самого блока
+// --- НАСТРОЙКА ПИНОВ ---
+const int PIN_BATTERY_SENSE = A0; // Вход: Аналоговый пин для замера АКБ
+const int PIN_DOOR_TRIGGER  = 2;  
+const int PIN_IGNITION      = 3;  
+const int PIN_ACC_OUTPUT    = 4;  
+const int PIN_HOLD_POWER    = 5;  
 
 // --- ТАЙМИНГИ И КОНСТАНТЫ ---
-const unsigned long TIMEOUT_WAIT_IGNITION = 300000; // 5 минут ожидания зажигания в миллисекундах (5 * 60 * 1000)
+const unsigned long TIMEOUT_WAIT_IGNITION = 300000; // 5 минут
+const float CRITICAL_BATTERY_VOLTAGE      = 11.9;    // Порог отключения (Вольты)
 
-// --- СОСТОЯНИЯ СИСТЕМЫ ---
 enum SystemState {
-  STATE_SLEEP,            // Полный покой (блок выключен или ждет триггера)
-  STATE_PRE_DRIVE_WAKE,   // Машина открыта, магнитола запущена, ждем зажигание
-  STATE_DRIVE,            // Зажигание включено, идет обычная поездка
-  STATE_SHUTDOWN          // Поездка окончена, тушим цепи, готовимся к самоотключению
+  STATE_SLEEP,
+  STATE_PRE_DRIVE_WAKE,
+  STATE_DRIVE,
+  STATE_SHUTDOWN
 };
 
-SystemState currentState = STATE_SLEEP; // Стартовое состояние
-unsigned long wakeUpTimerStart = 0;     // Точка отсчета для 5-минутного таймера
+SystemState currentState = STATE_SLEEP;
+unsigned long wakeUpTimerStart = 0;
+
+// Функция для точного и стабильного замера напряжения АКБ
+float readBatteryVoltage() {
+  int rawSum = 0;
+  
+  // Делаем 10 быстрых замеров для фильтрации случайных всплесков
+  for (int i = 0; i < 10; i++) {
+    rawSum += analogRead(PIN_BATTERY_SENSE);
+    delay(2); // Микропауза для стабилизации АЦП
+  }
+  
+  float averageRaw = (float)rawSum / 10.0;
+  
+  // Пересчет сырого значения АЦП в реальные Вольты с учетом делителя (10кОм / 3.3кОм)
+  // 5.0 - опорное напряжение. 
+  float vPin = (averageRaw * 5.0) / 1023.0; 
+  float vBatt = vPin * ((10.0 + 3.3) / 3.3); 
+  
+  return vBatt;
+}
 
 void setup() {
-  Serial.begin(9600); // Только для отладки на столе
+  Serial.begin(9600);
   
-  // Конфигурация входов с подтяжкой к питанию, чтобы не ловить шумы в авто
   pinMode(PIN_DOOR_TRIGGER, INPUT_PULLUP);
   pinMode(PIN_IGNITION, INPUT_PULLUP);
-  
-  // Конфигурация выходов
   pinMode(PIN_ACC_OUTPUT, OUTPUT);
   pinMode(PIN_HOLD_POWER, OUTPUT);
   
-  // Первая строчка — держим транзистор собственного питания!
+  // 1. Сразу жестко держим питание самого блока
   digitalWrite(PIN_HOLD_POWER, HIGH); 
-  
-  // Принудительно тушим ACC при старте, пока не проверим условия
   digitalWrite(PIN_ACC_OUTPUT, LOW);
   
-  Serial.println("MCU Initialized. Power Latched.");
+  Serial.println("MCU Awaked. Executing Battery Guard test...");
   
-  // Если мы проснулись от аппаратного будильника RTC или концевика,
-  // мы сразу переходим в режим предварительного прогрева Андроида
-  currentState = STATE_PRE_DRIVE_WAKE;
-  wakeUpTimerStart = millis(); // Запускаем 5-минутный таймер
-  digitalWrite(PIN_ACC_OUTPUT, HIGH); // ВКЛЮЧАЕМ АНДРОИД!
-  Serial.println("State Changed: PRE-DRIVE WAKE. Android is booting...");
+  // 2. ЭКСПРЕСС-ДИАГНОСТИКА АКБ ПРИ ПРОСЫПАНИИ
+  float currentVoltage = readBatteryVoltage();
+  Serial.print("Measured Battery Voltage: ");
+  Serial.print(currentVoltage);
+  Serial.println("V");
+  
+  if (currentVoltage < CRITICAL_BATTERY_VOLTAGE) {
+    // Аккумулятор сел! Включать Андроид преступно.
+    Serial.println("CRITICAL: Battery is too low! Aborting boot to save engine start.");
+    currentState = STATE_SHUTDOWN; // Принудительно отправляем блок на самоликвидацию
+  } else {
+    // Все отлично, энергии достаточно
+    Serial.println("Battery Guard: PASS. Initiating Pre-Drive Wake-Up.");
+    currentState = STATE_PRE_DRIVE_WAKE;
+    wakeUpTimerStart = millis();
+    digitalWrite(PIN_ACC_OUTPUT, HIGH); // ВКЛЮЧАЕМ АНДРОИД
+  }
 }
 
 void loop() {
-  // Считываем физические сигналы из машины
-  // (В реальной схеме они инвертируются оптопарой, учитываем логику LOW/HIGH)
-  bool isIgnitionOn = (digitalRead(PIN_IGNITION) == LOW); // LOW значит +12В пришло на оптопару
+  bool isIgnitionOn = (digitalRead(PIN_IGNITION) == LOW);
   
+  // В режиме поездки можно периодически проверять генератор, но для старта логика в setup()
   switch (currentState) {
     
     case STATE_PRE_DRIVE_WAKE:
-      // Магнитола уже включена нашим блоком. Ждем действий водителя.
       if (isIgnitionOn) {
-        // Водитель сел в машину и повернул зажигание!
         currentState = STATE_DRIVE;
-        Serial.println("State Changed: DRIVE. Ignition detected. Normal operation.");
+        Serial.println("State Changed: DRIVE.");
       } 
       else if (millis() - wakeUpTimerStart >= TIMEOUT_WAIT_IGNITION) {
-        // Прошло 5 минут, зажигание так и не включили (ложное открытие)
         currentState = STATE_SHUTDOWN;
-        Serial.println("State Changed: SHUTDOWN. Timeout reached without ignition.");
+        Serial.println("State Changed: SHUTDOWN (Timeout).");
       }
       break;
 
     case STATE_DRIVE:
-      // Мы в режиме поездки. Магнитола работает. Контролируем окончание поездки.
       if (!isIgnitionOn) {
-        // Водитель заглушил машину и выключил зажигание
         currentState = STATE_SHUTDOWN;
-        Serial.println("State Changed: SHUTDOWN. Engine turned off.");
+        Serial.println("State Changed: SHUTDOWN (Ignition Off).");
       }
       break;
 
     case STATE_SHUTDOWN:
-      // Безопасный перевод систем в режим покоя
-      digitalWrite(PIN_ACC_OUTPUT, LOW); // Отключаем провод ACC магнитолы (магнитола спит)
-      Serial.println("Android sent to Sleep Mode.");
+      digitalWrite(PIN_ACC_OUTPUT, LOW); // Гасим магнитолу
+      Serial.println("Android ACC -> LOW");
+      delay(500);
       
-      delay(500); // Даем полсекунды на переходные процессы в реле/ключах
+      Serial.println("Cutting down own power. System Sleep.");
+      digitalWrite(PIN_HOLD_POWER, LOW); // Полное обесточивание блока
       
-      Serial.println("Self-power cut down. Goodbye.");
-      delay(10);
-      
-      // Финальный аккорд — тушим пин удержания питания. 
-      // Силовой MOSFET закрывается, блок полностью обесточивает САМ СЕБЯ.
-      digitalWrite(PIN_HOLD_POWER, LOW); 
-      
-      // Если схема собрана на макетке без MOSFET, этот бесконечный цикл — заглушка
-      while(true) { currentState = STATE_SLEEP; } 
-      break;
-      
-    default:
+      while(true) { currentState = STATE_SLEEP; }
       break;
   }
 }
