@@ -1,14 +1,20 @@
 #include <Arduino.h>
-// --- НАСТРОЙКА ПИНОВ ---
-const int PIN_BATTERY_SENSE = A0; // Вход: Аналоговый пин для замера АКБ
-const int PIN_DOOR_TRIGGER  = 2;  
-const int PIN_IGNITION      = 3;  
-const int PIN_ACC_OUTPUT    = 4;  
-const int PIN_HOLD_POWER    = 5;  
+// =========================================================================
+// АВТОМОБИЛЬНЫЙ КОНТРОЛЛЕР ПИТАНИЯ АНДРОИД-МАГНИТОЛЫ (ВЕРСИЯ 3.0 FINAL)
+// Разработано для Arduino Mega Pro с защитой АКБ и фильтрацией поворотников
+// =========================================================================
+
+// --- НАСТРОЙКА ПИНОВ (КОНФИГУРАЦИЯ ДЛЯ ARDUINO MEGA) ---
+const int PIN_BATTERY_SENSE = A0;   // Аналоговый вход: замер напряжения АКБ
+const int PIN_DOOR_TRIGGER  = 2;    // Цифровой вход (через оптопару): сигнал ЦЗ / Двери / Плафона
+const int PIN_IGNITION      = 3;    // Цифровой вход (через оптопару): Зажигание (Клемма 15)
+const int PIN_ACC_OUTPUT    = 4;    // Цифровой выход: управление ключом BTS442 (ACC магнитолы)
+const int PIN_HOLD_POWER    = 5;    // Цифровой выход: удержание питания схемы (на базу BC547B)
 
 // --- ТАЙМИНГИ И КОНСТАНТЫ ---
-const unsigned long TIMEOUT_WAIT_IGNITION = 300000; // 5 минут
-const float CRITICAL_BATTERY_VOLTAGE      = 11.9;    // Порог отключения (Вольты)
+const unsigned long TIMEOUT_WAIT_IGNITION = 300000; // Время ожидания зажигания (5 минут)
+const unsigned long WAKE_FILTER_DELAY     = 3000;   // Фильтр поворотников (3 секунды)
+const float CRITICAL_BATTERY_VOLTAGE      = 11.9;    // Порог защиты аккумулятора от разряда (Вольты)
 
 enum SystemState {
   STATE_SLEEP,
@@ -20,95 +26,123 @@ enum SystemState {
 SystemState currentState = STATE_SLEEP;
 unsigned long wakeUpTimerStart = 0;
 
-// Функция для точного и стабильного замера напряжения АКБ
+// Функция точного измерения напряжения аккумулятора
 float readBatteryVoltage() {
   int rawSum = 0;
-  
-  // Делаем 10 быстрых замеров для фильтрации случайных всплесков
   for (int i = 0; i < 10; i++) {
     rawSum += analogRead(PIN_BATTERY_SENSE);
-    delay(2); // Микропауза для стабилизации АЦП
+    delay(2); // Стабилизация АЦП
   }
-  
   float averageRaw = (float)rawSum / 10.0;
   
-  // Пересчет сырого значения АЦП в реальные Вольты с учетом делителя (10кОм / 3.3кОм)
-  // 5.0 - опорное напряжение. 
+  // Пересчет АЦП (5.0В - опорное, делитель 10кОм / 3.3кОм)
   float vPin = (averageRaw * 5.0) / 1023.0; 
   float vBatt = vPin * ((10.0 + 3.3) / 3.3); 
-  
   return vBatt;
 }
 
 void setup() {
-  Serial.begin(9600);
-  
-  pinMode(PIN_DOOR_TRIGGER, INPUT_PULLUP);
-  pinMode(PIN_IGNITION, INPUT_PULLUP);
-  pinMode(PIN_ACC_OUTPUT, OUTPUT);
+  // 1. МГНОВЕННО захватываем питание платы, пока не исчез физический импульс от двери!
   pinMode(PIN_HOLD_POWER, OUTPUT);
-  
-  // 1. Сразу жестко держим питание самого блока
   digitalWrite(PIN_HOLD_POWER, HIGH); 
-  digitalWrite(PIN_ACC_OUTPUT, LOW);
   
-  Serial.println("MCU Awaked. Executing Battery Guard test...");
+  // Инициализация остальных пинов
+  pinMode(PIN_ACC_OUTPUT, OUTPUT);
+  digitalWrite(PIN_ACC_OUTPUT, LOW); // Магнитола пока строго выключена
   
-  // 2. ЭКСПРЕСС-ДИАГНОСТИКА АКБ ПРИ ПРОСЫПАНИИ
+  pinMode(PIN_DOOR_TRIGGER, INPUT_PULLUP); // Используем подтяжку для оптопары
+  pinMode(PIN_IGNITION, INPUT_PULLUP);
+  
+  Serial.begin(9600);
+  Serial.println(F("--- MCU AWAKED ---"));
+  
+  // 2. ЭКСПРЕСС-ДИАГНОСТИКА АКБ
   float currentVoltage = readBatteryVoltage();
-  Serial.print("Measured Battery Voltage: ");
-  Serial.print(currentVoltage);
-  Serial.println("V");
+  Serial.print(F("Battery Voltage: ")); Serial.print(currentVoltage); Serial.println(F("V"));
   
   if (currentVoltage < CRITICAL_BATTERY_VOLTAGE) {
-    // Аккумулятор сел! Включать Андроид преступно.
-    Serial.println("CRITICAL: Battery is too low! Aborting boot to save engine start.");
-    currentState = STATE_SHUTDOWN; // Принудительно отправляем блок на самоликвидацию
+    Serial.println(F("CRITICAL: Battery Low! Emergency Shutdown."));
+    currentState = STATE_SHUTDOWN;
+    return;
+  }
+  
+  // 3. ФИЛЬТР ЛОЖНЫХ ПРОСЫПАНИЙ (Поворотники / Постановка на охрану)
+  Serial.println(F("Waiting for stabilization (Anti-Indicator Filter)..."));
+  unsigned long filterStart = millis();
+  bool realWakeUpDetected = false;
+  
+  while (millis() - filterStart < WAKE_FILTER_DELAY) {
+    // Если в течение 3 секунд человек включил зажигание — это точно не ложный сигнал
+    if (digitalRead(PIN_IGNITION) == LOW) { 
+      realWakeUpDetected = true; 
+      break; 
+    }
+    // Если импульс двери/ЦЗ/плафона все еще активен (удерживается), значит машина открыта
+    if (digitalRead(PIN_DOOR_TRIGGER) == LOW) {
+      realWakeUpDetected = true;
+    }
+  }
+  
+  if (!realWakeUpDetected) {
+    // Сигнал моргнул и пропал (машину просто закрыли, или это был короткий импульс)
+    Serial.println(F("False alarm (Indicator blink detected). Going back to sleep immediately."));
+    currentState = STATE_SHUTDOWN;
   } else {
-    // Все отлично, энергии достаточно
-    Serial.println("Battery Guard: PASS. Initiating Pre-Drive Wake-Up.");
+    // Сигнал подтвержден, хозяин открыл машину или завел её
+    Serial.println(F("Wake-up confirmed. Turning on Android ACC."));
+    digitalWrite(PIN_ACC_OUTPUT, HIGH); // ВКЛЮЧАЕМ BTS442 (Магнитолу)
     currentState = STATE_PRE_DRIVE_WAKE;
     wakeUpTimerStart = millis();
-    digitalWrite(PIN_ACC_OUTPUT, HIGH); // ВКЛЮЧАЕМ АНДРОИД
   }
 }
 
 void loop() {
+  // Оптопара инвертирует сигнал: когда на ней +12В, пин Ардуино притягивается к GND (LOW)
   bool isIgnitionOn = (digitalRead(PIN_IGNITION) == LOW);
   
-  // В режиме поездки можно периодически проверять генератор, но для старта логика в setup()
   switch (currentState) {
     
     case STATE_PRE_DRIVE_WAKE:
+      // Ждем зажигания в течение 5 минут
       if (isIgnitionOn) {
         currentState = STATE_DRIVE;
-        Serial.println("State Changed: DRIVE.");
+        Serial.println(F("State Changed: DRIVE. Enjoy your ride."));
       } 
       else if (millis() - wakeUpTimerStart >= TIMEOUT_WAIT_IGNITION) {
         currentState = STATE_SHUTDOWN;
-        Serial.println("State Changed: SHUTDOWN (Timeout).");
+        Serial.println(F("State Changed: SHUTDOWN (Timeout reached)."));
       }
       break;
 
     case STATE_DRIVE:
+      // В режиме поездки нам плевать на любые клацанья ЦЗ или дверей. Мы смотрим только на зажигание.
       if (!isIgnitionOn) {
         currentState = STATE_SHUTDOWN;
-        Serial.println("State Changed: SHUTDOWN (Ignition Off).");
+        Serial.println(F("State Changed: SHUTDOWN (Ignition Off)."));
       }
       break;
 
     case STATE_SHUTDOWN:
-      digitalWrite(PIN_ACC_OUTPUT, LOW); // Гасим магнитолу
-      Serial.println("Android ACC -> LOW");
-      delay(500);
+      Serial.println(F("Shutting down ACC..."));
+      digitalWrite(PIN_ACC_OUTPUT, LOW); // Обесточиваем магнитолу через BTS442
+      delay(500); // Короткая пауза для записи кэша магнитолы
       
-      Serial.println("Cutting down own power. System Sleep.");
-      digitalWrite(PIN_HOLD_POWER, LOW); // Полное обесточивание блока
+      Serial.println(F("Releasing PIN_HOLD_POWER. Goodbye."));
+      digitalWrite(PIN_HOLD_POWER, LOW); // Отпускаем базу BC547B, снимая питание схемы
       
-      while(true) { currentState = STATE_SLEEP; }
+      // ЗАЩИТА: Если палец водителя все еще жмет кнопку ЦЗ, или конденсаторы в сети разряжаются,
+      // крутимся в пустом цикле и ждем полной физической смерти питания, блокируя выполнение кода.
+      while(true) {
+        // Процессор застывает здесь до полного исчезновения напряжения на шине 5V
+      }
+      break;
+      
+    case STATE_SLEEP:
+      // Сюда программа никогда не дойдет, так как питание отключится физически
       break;
   }
 }
+
 
 // #include <Arduino.h>
 
