@@ -110,17 +110,67 @@ union RealDashFrame {
   } __attribute__((packed)) frame;
   uint8_t bytes[12]; // Полный размер кадра (4 байта ID + 8 байт данных)
 };
+void sendDataToRealDash() {
+  // 1. Создаем структуру буфера под наши 5 кадров (всего 18 байт данных)
+  uint8_t serialBlock[22]; // 4 байта заголовка + 18 байт данных
 
-void sendRealDashFrame(uint32_t canId, uint8_t* data8Bytes) {
-  const uint8_t serialBlockHeader[4] = { 0x44, 0x33, 0x22, 0x11 };
-  Serial2.write(serialBlockHeader, 4);
+  // 2. Запись стартового заголовка RealDash CAN (4 байта)
+  serialBlock[0] = 0x44; // 'D'
+  serialBlock[1] = 0x33; // '3'
+  serialBlock[2] = 0x22; // '2'
+  serialBlock[3] = 0x11; // '1'
+
+  // --- КАДР 3200 (Обороты и Скорость) ---
+  uint16_t rd_rpm = (uint16_t)currentRPM;     // Например, 2500
+  uint16_t rd_speed = (uint16_t)currentSpeed; // Например, 60
+  memcpy(&serialBlock[4], &rd_rpm, 2);
+  memcpy(&serialBlock[6], &rd_speed, 2);
+
+  // --- КАДР 3201 (Вольтметр и ДТОЖ) ---
+  // Умножаем вольты на 100, чтобы передать float как целое число (12.26 -> 1226)
+  uint16_t rd_voltage = (uint16_t)(batteryVoltage * 100.0); 
+  uint16_t rd_ect = (uint16_t)rawECT; // Значение АЦП (0-1023)
+  memcpy(&serialBlock[8], &rd_voltage, 2);
+  memcpy(&serialBlock[10], &rd_ect, 2);
+
+  // --- КАДР 3202 (ДУТ и Дискретные входы) ---
+  uint16_t rd_fuel = (uint16_t)rawFuel; // Значение АЦП (0-1023)
   
-  RealDashFrame myFrame;
-  myFrame.frame.canId = canId;
-  memcpy(myFrame.frame.data, data8Bytes, 8);
+  // Собираем битовую маску для зажигания и дверей
+  uint16_t rd_digitals = 0;
+  if (digitalRead(PIN_IGNITION) == LOW)     rd_digitals |= (1 << 0); // Бит 0: Зажигание (учитывая полярность оптопары)
+  if (digitalRead(PIN_DOOR_TRIGGER) == LOW) rd_digitals |= (1 << 1); // Бит 1: Центральный замок
   
-  Serial2.write(myFrame.bytes, 12);
+  memcpy(&serialBlock[12], &rd_fuel, 2);
+  memcpy(&serialBlock[14], &rd_digitals, 2);
+
+  // --- КАДР 3203 (Лампы 101 и Лампы 102) ---
+  // Считываем байты состояний ламп, которые мы научились формировать ранее
+  uint8_t rd_lamps101 = currentLamps101Byte; 
+  uint8_t rd_lamps102 = currentLamps102Byte; 
+  serialBlock[16] = rd_lamps101;
+  serialBlock[17] = rd_lamps102;
+
+  // --- КАДР 3204 (Состояние силовых выходов) ---
+  uint16_t rd_outputs = 0;
+  if (digitalRead(PIN_HOLD_POWER) == HIGH) rd_outputs |= (1 << 0); // Бит 0
+  if (digitalRead(PIN_ACC_OUTPUT) == HIGH) rd_outputs |= (1 << 1); // Бит 1
+  memcpy(&serialBlock[18], &rd_outputs, 2);
+
+  // 3. Отправляем готовый бинарный пакет в UART-свисток
+  Serial2.write(serialBlock, 20); // 4 (заголовок) + 16 байт данных (кадры 3200-3203 полные, 3204 отправляет первые 2 байта)
 }
+
+// void sendRealDashFrame(uint32_t canId, uint8_t* data8Bytes) {
+//   const uint8_t serialBlockHeader[4] = { 0x44, 0x33, 0x22, 0x11 };
+//   Serial2.write(serialBlockHeader, 4);
+  
+//   RealDashFrame myFrame;
+//   myFrame.frame.canId = canId;
+//   memcpy(myFrame.frame.data, data8Bytes, 8);
+  
+//   Serial2.write(myFrame.bytes, 12);
+// }
 
 // Функция точного измерения напряжения аккумулятора
 float readBatteryVoltage(int counter) {
