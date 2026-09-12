@@ -152,30 +152,56 @@ void rpmPulseCounter() {
 void speedPulseCounter() {
   speedPulses++;
 }
-
+// Временно для тестов в Мониторе порта
+String createIndicatorsText (int counterIndicators, InputChannel indicators[]) { 
+  String textLamps = ""; // Текст для Монитора порта
+  for (int i = 0; i < counterIndicators; i++) {
+    indicators[i].currentState = (digitalRead(indicators[i].pin) == LOW);
+    if (indicators[i].currentState) {
+      textLamps += indicators[i].name;
+    }
+  }
+  return textLamps;
+}
+uint8_t createIndicatorsByte (int counterIndicators, InputChannel indicators[]) { 
+  uint8_t byteFrame = 0;
+  for (int i = 0; i < counterIndicators; i++) {
+    indicators[i].currentState = (digitalRead(indicators[i].pin) == LOW);
+    if (indicators[i].currentState) {
+      byteFrame |= (1 << indicators[i].bitPosition);
+    }
+  }
+  return byteFrame;
+}
 void setup() {
   // 1. МГНОВЕННО захватываем питание платы, пока не исчез физический импульс от двери!
   pinMode(PIN_HOLD_POWER, OUTPUT);
   digitalWrite(PIN_HOLD_POWER, HIGH); 
   // Для RealDash ставится 115200. Для тестов в Мониторе Порта 2 оставляем 9600
   // Serial2.begin(115200); 
+  
   Serial2.begin(9600); 
   pinMode(17, INPUT_PULLUP); // Подтяжка RX линии Serial2
+
+  // Отправка в RealDash (ВРЕМЕННО ЗАКОММЕНТИРОВАНО ДЛЯ ТЕСТА В МОНИТОРЕ ПОРТА)
+  // sendRealDashFrame(104, { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
 
   //while(!Serial2); // Ожидание открытия Монитора порта 2
   Serial2.println(F("============ ЗАГРУЗКА СИСТЕМЫ ================"));
   // Инициализация остальных пинов
+
   pinMode(PIN_ACC_OUTPUT, OUTPUT);
   digitalWrite(PIN_ACC_OUTPUT, LOW); // Магнитола пока строго выключена
   
   pinMode(PIN_DOOR_TRIGGER, INPUT_PULLUP); // Используем подтяжку для оптопары
   pinMode(PIN_IGNITION, INPUT_PULLUP);
+
   
   // 2. ЭКСПРЕСС-ДИАГНОСТИКА АКБ
   Serial2.println(F("============ ПРОВЕРЯЕМ БАТАРЕЮ ==============="));
-  float currentVoltage = readBatteryVoltage(3);
-  Serial2.print(F("-------- Батарея: ")); Serial2.print(currentVoltage); Serial2.println(F("V--------"));
-  if (currentVoltage < CRITICAL_BATTERY_VOLTAGE) {
+  float startVolt = readBatteryVoltage(3);
+  Serial2.print(F("-------- Батарея: ")); Serial2.print(startVolt); Serial2.println(F("V--------"));
+  if (startVolt < CRITICAL_BATTERY_VOLTAGE) {
     Serial2.println(F("=========Батарея разряжена. Не включаем питание вообще======"));
     currentState = STATE_SHUTDOWN;
     return;
@@ -198,11 +224,15 @@ void setup() {
     if (currentDoorState == LOW && lastDoorState == HIGH) {
       doorCounter++; 
       Serial2.print(F("--------Количество нажатий брелка ЦЗ: ")); Serial2.println(doorCounter);
-    }// Считаем нажатия
-    // Serial2.print(F("Общее: ")); Serial2.println(doorCounter);
+    }
    lastDoorState = currentDoorState; 
   }
   Serial2.print(F("---- Общее количество: ")); Serial2.print(doorCounter);  Serial2.println(F("---------"));
+  // Отправка в RealDash (ВРЕМЕННО ЗАКОММЕНТИРОВАНО ДЛЯ ТЕСТА В МОНИТОРЕ ПОРТА)
+  uint8_t data103[8] = {0};
+  data103[0] = (uint8_t)(startVolt * 10.0); // 13.8V -> 138;
+  data103[1] = (uint8_t)(doorCounter);
+  // sendRealDashFrame(103, data103);
 
   // Первый раз нажали - включили пин
   // Если второй раз не нажали, будем заводить. Если нажали еще один и более раз, заводить не будем
@@ -243,8 +273,6 @@ void loop() {
   // =========================================================================
   if (currentState == STATE_PRE_DRIVE_WAKE || currentState == STATE_DRIVE) {
     unsigned long currentMillis = millis();
-    //uint8_t buffer[8]; // Временный буфер для упаковки байт
-
     // 1. БЫСТРЫЕ ДАТЧИКИ (CAN ID: 100)
     if (currentMillis - timerFastSensors >= INTERVAL_FAST) {
       timerFastSensors = currentMillis;    
@@ -273,50 +301,27 @@ void loop() {
       currentSpeed = (calcSpeed < 1.0) ? 0 : (uint16_t)calcSpeed;
 
       // --- Сборка байта ламп для Кадра 101 ---
-      // uint8_t byteFrame1 = 0;
-      String textLamps = ""; // Текст для Монитора порта
-      for (int i = 0; i < LAMPS_COUNT_1; i++) {
-       indicators1[i].currentState = (digitalRead(indicators1[i].pin) == LOW);
-       if (indicators1[i].currentState) {
-          byteFrame1 |= (1 << indicators1[i].bitPosition);
-          textLamps += indicators1[i].name;
-        }
-      }
-      
-      for (int i = 0; i < LAMPS_COUNT_2; i++) {
-       indicators2[i].currentState = (digitalRead(indicators2[i].pin) == LOW);
-       if (indicators2[i].currentState) {
-          byteFrame2 |= (1 << indicators2[i].bitPosition);
-          textLamps += indicators2[i].name;
-        }
-      }
-      
-      for (int i = 0; i < LAMPS_COUNT_3; i++) {
-       indicators3[i].currentState = (digitalRead(indicators3[i].pin) == LOW);
-       if (indicators3[i].currentState) {
-          byteFrame3 |= (1 << indicators3[i].bitPosition);
-          textLamps += indicators3[i].name;
-        }
-      }
       // --- Подготовка пакета данных для Кадра 101 ---
       uint8_t data101[8] = {0};
       data101[0] = lowByte(currentRPM);
       data101[1] = highByte(currentRPM);
       data101[2] = lowByte(currentSpeed);
       data101[3] = highByte(currentSpeed);
-      data101[4] = byteFrame1; // Байт ламп
-      data101[5] = byteFrame2; // Байт ламп
-      data101[6] = byteFrame3; // Байт ламп
+      data101[4] = createIndicatorsByte(LAMPS_COUNT_1, indicators1); // Байт ламп
+      data101[5] = createIndicatorsByte(LAMPS_COUNT_2, indicators2); // Байт ламп
+      data101[6] = createIndicatorsByte(LAMPS_COUNT_3, indicators3); // Байт ламп
       // Отправка в RealDash (ВРЕМЕННО ЗАКОММЕНТИРОВАНО ДЛЯ ТЕСТА В МОНИТОРЕ ПОРТА)
       // sendRealDashFrame(101, data101);
 
       // Вывод быстрых данных в Монитор порта
-      Serial2.print(" RPM: "); Serial2.print(currentRPM);
-      Serial2.print(" | SPD: "); Serial2.print(currentSpeed, 1); Serial2.println(" km/h");
-      Serial2.print(" LAMPS: "); Serial2.println(textLamps);
+      Serial2.print(F(" RPM: ")); Serial2.print(currentRPM);
+      Serial2.print(F(" | SPD: ")); Serial2.print(currentSpeed, 1); Serial2.println(F(" km/h"));
+      Serial2.print(F(" LAMPS_1: ")); Serial2.println(createIndicatorsText(LAMPS_COUNT_1, indicators1));
+      Serial2.print(F(" LAMPS_2: ")); Serial2.println(createIndicatorsText(LAMPS_COUNT_2, indicators2));
+      Serial2.print(F(" LAMPS_3: ")); Serial2.println(createIndicatorsText(LAMPS_COUNT_3, indicators3));
 
-      if (digitalRead(PIN_IGNITION) == LOW)     Serial2.println(" [ Зажигание ]"); 
-      if (digitalRead(PIN_DOOR_TRIGGER) == LOW) Serial2.println(" [ ЦЗ ] ");
+      if (digitalRead(PIN_IGNITION) == LOW)     Serial2.println(F(" [ Зажигание ]")); 
+      if (digitalRead(PIN_DOOR_TRIGGER) == LOW) Serial2.println(F(" [ ЦЗ ] "));
     }
 
     // 3. МЕДЛЕННЫЕ ДАТЧИКИ (CAN ID: 102, каждые 2 секунды)
@@ -350,11 +355,11 @@ void loop() {
 
 
       // Вывод медленных данных в Монитор порта
-      Serial2.println("----------------------------------------------");
-      Serial2.print(" VOLTAGE: "); Serial2.print(batteryVoltage, 2); Serial2.print(" V");
-      Serial2.print(" | ДТОЖ ADC: "); Serial2.print(rawECT); 
-      Serial2.print(" | ДУТ ADC: "); Serial2.println(rawFuel);
-      Serial.println("----------------------------------------------");
+      Serial2.println(F("----------------------------------------------"));
+      Serial2.print(F(" VOLTAGE: ")); Serial2.print(batteryVoltage, 2); Serial2.print(F(" V"));
+      Serial2.print(F(" | ДТОЖ ADC: ")); Serial2.print(rawECT); 
+      Serial2.print(F(" | ДУТ ADC: ")); Serial2.println(rawFuel);
+      Serial.println(F("----------------------------------------------"));
     }
   }
   // =========================================================================
@@ -368,6 +373,8 @@ void loop() {
     
     case STATE_PRE_DRIVE_WAKE:
       // Ждем зажигания в течение 5 минут
+      // Отправка в RealDash (ВРЕМЕННО ЗАКОММЕНТИРОВАНО ДЛЯ ТЕСТА В МОНИТОРЕ ПОРТА)
+      // sendRealDashFrame(104, { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
       if (isIgnitionOn) {
         currentState = STATE_DRIVE;
         Serial2.println(F("Состояние изменено на DRIVE. Наслаждайтесь поездкой"));
@@ -379,6 +386,8 @@ void loop() {
       break;
 
     case STATE_DRIVE:
+      // Отправка в RealDash (ВРЕМЕННО ЗАКОММЕНТИРОВАНО ДЛЯ ТЕСТА В МОНИТОРЕ ПОРТА)
+      // sendRealDashFrame(104, { 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
       // В режиме поездки нам плевать на любые клацанья ЦЗ или дверей. Мы смотрим только на зажигание.
       if (!isIgnitionOn) {
         currentState = STATE_SHUTDOWN;
@@ -387,6 +396,8 @@ void loop() {
       break;
 
     case STATE_SHUTDOWN:
+      // Отправка в RealDash (ВРЕМЕННО ЗАКОММЕНТИРОВАНО ДЛЯ ТЕСТА В МОНИТОРЕ ПОРТА)
+      // sendRealDashFrame(104, { 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
       Serial2.println(F("Выключаем питание Андроид..."));
       digitalWrite(PIN_ACC_OUTPUT, LOW); // Обесточиваем магнитолу через BTS442
       delay(500); // Короткая пауза для записи кэша магнитолы
