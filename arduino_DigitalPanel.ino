@@ -7,7 +7,6 @@
 // ==========================================================================
 // --- КОНФИГУРАЦИЯ ПИНОВ ---
 // ==========================================================================
-
 const byte PIN_FUEL = A0;           // ДУТ (резистор 330 Ом)
 const byte PIN_ECT = A1;            // ДТОЖ (резистор 330 Ом)
 const byte PIN_BATTERY_SENSE = A2;  // Вольтметр (делитель 10кОм и 3.3кОм)
@@ -22,62 +21,51 @@ const byte PIN_IGNITION     = 7;    // Цифровой вход (через о�
 // --- СТРУКТУРА И МАССИВЫ ИНДИКАТОРОВ (ЛАМП) ---
 // ==========================================================================
 struct InputChannel {
-  int pin;            // Номер пина Arduino
-  byte bitPosition;   // В какой бит байта упаковать (0..7)
-  bool currentState;  // Текущее состояние (true/false)
+  byte pin;            // Номер пина Arduino
   String name;        // Имя для вывода в Монитор порта
 };
 
 // LAMPS 1: Стандартные лампы
-const int LAMPS_COUNT_1 = 8;
-InputChannel indicators1[LAMPS_COUNT_1] = {
-  {9, 0, false, "[Левый поворотник] "},
-  {11, 1, false, "[Правый поворотник] "},
-  {10, 2, false, "[Дальний свет] "},
-  {23, 3, false, "[Ближний свет] "},
-  {25, 4, false, "[Передние ПТФ] "},
-  {27, 5, false, "[Задний ПТФ] "},
-  {29, 6, false, "[Габариты] "},
-  {31, 7, false, "[P_10] "}
-};
-// LAMPS 2: Стандартные лампы
-const int LAMPS_COUNT_2 = 8;
-InputChannel indicators2[LAMPS_COUNT_2] = {
-  {32, 0, false, "[Давление масла] "}, 
-  {34, 1, false, "[Ручник] "}, 
-  {36, 2, false, "[Check Engine] "}, 
-  {38, 3, false, "[Аккумулятор] "}, 
-  {40, 4, false, "[ABS] "},
-  {42, 5, false, "[Перегрев ОЖ] "},
-  {44, 6, false, "[Ремень безопасности] "},
-  {33, 7, false, "[Двери открыты] "}
-};
-// LAMPS 3: Стандартные лампы
-const int LAMPS_COUNT_3 = 3;
-InputChannel indicators3[LAMPS_COUNT_3] = {
-  {35, 0, false, "[Подушки безопасности] "}, 
-  {37, 1, false, "[Иммобилайзер] "}, 
-  {39, 2, false, "[Пила] "}
+const int INDICATORS_COUNT = 19;
+InputChannel indicators[INDICATORS_COUNT] = {
+  {9, "[Левый поворотник] "},
+  {11, "[Правый поворотник] "},
+  {10, "[Дальний свет] "},
+  {23, "[Ближний свет] "},
+  {25, "[Передние ПТФ] "},
+  {27, "[Задний ПТФ] "},
+  {29, "[Габариты] "},
+  {31, "[P_10] "},
+  {32, "[Давление масла] "}, 
+  {34, "[Ручник] "}, 
+  {36, "[Check Engine] "}, 
+  {38, "[Аккумулятор] "}, 
+  {40, "[ABS] "},
+  {42, "[Перегрев ОЖ] "},
+  {44, "[Ремень безопасности] "},
+  {33, "[Двери открыты] "},
+  {35, "[Подушки безопасности] "}, 
+  {37, "[Иммобилайзер] "}, 
+  {39, "[Пила] "}
 };
 
 // ==========================================================================
 // --- ПЕРЕМЕННЫЕ И ТАЙМИНГИ ---
 // ==========================================================================
-const unsigned long TIMEOUT_WAIT_IGNITION = 12000; // Время ожидания зажигания
-const unsigned long WAKE_FILTER_DELAY     = 4000;   // Фильтр сигнала ЦЗ
-const float CRITICAL_BATTERY_VOLTAGE      = 10.0;    // Порог защиты аккумулятора от разряда (Вольты)
+const unsigned long TIMEOUT_WAIT_IGNITION = 18000; // Время ожидания зажигания
+const unsigned long WAKE_FILTER_DELAY     = 1000;   // Фильтр сигнала ЦЗ
+const float CRITICAL_BATTERY_VOLTAGE      = 11.7;    // Порог защиты аккумулятора от разряда (Вольты)
 
 volatile unsigned long rpmPulses = 0;
 volatile unsigned long speedPulses = 0;
-//unsigned long lastUpdateTime = 0;
 
 unsigned long timerFastSensors = 0;
 unsigned long timerNormSensors = 0;
 unsigned long timerSlowSensors = 0;
 
-const unsigned long INTERVAL_FAST = 500;   // 500 мс
-const unsigned long INTERVAL_NORM = 1000;  // 1000 мс (Скорость, RPM, Кадр 101)
-const unsigned long INTERVAL_SLOW = 2000; // 2000 мс (Вольтметр, ДТОЖ, ДУТ, Кадр 102)
+const unsigned long INTERVAL_FAST = 500;  
+const unsigned long INTERVAL_NORM = 1000; 
+const unsigned long INTERVAL_SLOW = 2000; 
 
 // Коэффициенты под Nissan Almera G15
 const int pulsesPerTurnRPM = 2;        
@@ -85,14 +73,13 @@ const float pulsesPerKmSpeed = 6000.0;
 const float dividerRatio = 4.0523;     // (9,92кОм + 3.25кОм) / 3.25кОм
 
 // Глобальные переменные данных
-uint16_t currentRPM = 0;
-uint16_t currentSpeed = 0;
+unsigned int currentRPM = 0;
+unsigned int currentSpeed = 0;
 float batteryVoltage = 0;
-uint16_t rawECT = 0;
-uint16_t rawFuel = 0;
-uint8_t byteFrame1 = 0;
-uint8_t byteFrame2 = 0;
-uint8_t byteFrame3 = 0;
+unsigned int rawECT = 0;
+unsigned int rawFuel = 0;
+uint32_t byteIndicators = 0;
+String textLampsToSerial = "";
 // ==========================================================================
 // --- СОСТОЯНИЕ СИСТЕМЫ ---
 // ==========================================================================
@@ -106,30 +93,17 @@ SystemState currentState = STATE_PRE_DRIVE_WAKE;
 unsigned long wakeUpTimerStart = 0;
 
 // ==========================================================================
-// --- СТРУКТУРА И ФУНКЦИЯ ОТПРАВКИ REALDASH CAN ---
+// --- ФУНКЦИЯ ОТПРАВКИ REALDASH CAN ---
 // ==========================================================================
-union RealDashFrame {
-  struct {
-    uint32_t canId;
-    uint8_t data[8];
-  } __attribute__((packed)) frame;
-  uint8_t bytes[12]; // Полный размер кадра (4 байта ID + 8 байт данных)
-};
-
-
-void sendRealDashFrame(uint32_t canId, uint8_t* data8Bytes) {
+void sendRealDashFrame(unsigned long canId, const uint8_t* data8Bytes) {
   const uint8_t serialBlockHeader[4] = { 0x44, 0x33, 0x22, 0x11 };
-  Serial2.write(serialBlockHeader, 4);
-  
-  RealDashFrame myFrame;
-  myFrame.frame.canId = canId;
-  memcpy(myFrame.frame.data, data8Bytes, 8);
-  
-  Serial2.write(myFrame.bytes, 12);
+  Serial.write(serialBlockHeader, 4);
+  Serial.write((const uint8_t*)&canId, 4);
+  Serial.write(data8Bytes, 8);
 }
 
 // Функция точного измерения напряжения аккумулятора
-float readBatteryVoltage(int counter) {
+int readBatteryVoltageX10(int counter) {
   // 1. ХОЛОСТОЙ ВЫСТРЕЛ (Dummy Read): переключаем АЦП на пин вольтметра
   // и даем зарядиться внутреннему конденсатору. Результат просто выбрасываем.
   analogRead(PIN_BATTERY_SENSE); 
@@ -141,8 +115,8 @@ float readBatteryVoltage(int counter) {
   }
   
   float averageRaw = (float)rawSum / (float)counter;
-  float vPin = (averageRaw * 5.0) / 1023.0; 
-  return vPin * dividerRatio; 
+  float vPin = ((averageRaw * 5.0) / 1023.0) * dividerRatio;
+  return vPin  * 10; 
 }
 // --- ФУНКЦИИ ОБРАБОТКИ ПРЕРЫВАНИЙ ---
 void rpmPulseCounter() {
@@ -152,63 +126,34 @@ void rpmPulseCounter() {
 void speedPulseCounter() {
   speedPulses++;
 }
-// Временно для тестов в Мониторе порта
-String createIndicatorsText (int counterIndicators, InputChannel indicators[]) { 
-  String textLamps = ""; // Текст для Монитора порта
-  for (int i = 0; i < counterIndicators; i++) {
-    indicators[i].currentState = (digitalRead(indicators[i].pin) == LOW);
-    if (indicators[i].currentState) {
-      textLamps += indicators[i].name;
-    }
-  }
-  return textLamps;
-}
-uint8_t createIndicatorsByte (int counterIndicators, InputChannel indicators[]) { 
-  uint8_t byteFrame = 0;
-  for (int i = 0; i < counterIndicators; i++) {
-    indicators[i].currentState = (digitalRead(indicators[i].pin) == LOW);
-    if (indicators[i].currentState) {
-      byteFrame |= (1 << indicators[i].bitPosition);
-    }
-  }
-  return byteFrame;
-}
+
 void setup() {
   // 1. МГНОВЕННО захватываем питание платы, пока не исчез физический импульс от двери!
   pinMode(PIN_HOLD_POWER, OUTPUT);
   digitalWrite(PIN_HOLD_POWER, HIGH); 
-  // Для RealDash ставится 115200. Для тестов в Мониторе Порта 2 оставляем 9600
-  // Serial2.begin(115200); 
   
-  Serial2.begin(9600); 
-  pinMode(17, INPUT_PULLUP); // Подтяжка RX линии Serial2
-
-  // Отправка в RealDash (ВРЕМЕННО ЗАКОММЕНТИРОВАНО ДЛЯ ТЕСТА В МОНИТОРЕ ПОРТА)
-  // sendRealDashFrame(104, { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
-
-  //while(!Serial2); // Ожидание открытия Монитора порта 2
+  Serial2.begin(9600);
+  delay(100);
   Serial2.println(F("============ ЗАГРУЗКА СИСТЕМЫ ================"));
+  
   // Инициализация остальных пинов
-
   pinMode(PIN_ACC_OUTPUT, OUTPUT);
   digitalWrite(PIN_ACC_OUTPUT, LOW); // Магнитола пока строго выключена
   
   pinMode(PIN_DOOR_TRIGGER, INPUT_PULLUP); // Используем подтяжку для оптопары
   pinMode(PIN_IGNITION, INPUT_PULLUP);
 
-  
   // 2. ЭКСПРЕСС-ДИАГНОСТИКА АКБ
-  Serial2.println(F("============ ПРОВЕРЯЕМ БАТАРЕЮ ==============="));
-  float startVolt = readBatteryVoltage(3);
-  Serial2.print(F("-------- Батарея: ")); Serial2.print(startVolt); Serial2.println(F("V--------"));
-  if (startVolt < CRITICAL_BATTERY_VOLTAGE) {
-    Serial2.println(F("=========Батарея разряжена. Не включаем питание вообще======"));
+  Serial2.println(F("============ ПРОВЕРЯЕМ БАТАРЕЮ И НАЖАТИЕ НА БРЕЛОК ЦЗ ==============="));
+  batteryVoltage = readBatteryVoltageX10(3) * 0.1;
+  Serial2.print(F("-------- Батарея: ")); Serial2.print(batteryVoltage); Serial2.println(F("V--------"));
+  if ((batteryVoltage) < CRITICAL_BATTERY_VOLTAGE) {
+    Serial2.println(F("=========Выключаем питание вообще======"));
     currentState = STATE_SHUTDOWN;
     return;
   }
   
   // 3. ФИЛЬТР НАЖАТИЙ НА ЦЗ
-  Serial2.println(F("======= ПРОВЕРЯЕМ НАЖАТИЕ НА БРЕЛОК ЦЗ ======="));
   unsigned long filterStart = millis();
   bool realWakeUpDetected = false;
   int doorCounter = 0; // Счетчик нажатий
@@ -223,29 +168,21 @@ void setup() {
     bool currentDoorState = digitalRead(PIN_DOOR_TRIGGER);
     if (currentDoorState == LOW && lastDoorState == HIGH) {
       doorCounter++; 
-      Serial2.print(F("--------Количество нажатий брелка ЦЗ: ")); Serial2.println(doorCounter);
+      Serial2.println(F("--------Нажали----------------- "));
     }
    lastDoorState = currentDoorState; 
   }
-  Serial2.print(F("---- Общее количество: ")); Serial2.print(doorCounter);  Serial2.println(F("---------"));
-  // Отправка в RealDash (ВРЕМЕННО ЗАКОММЕНТИРОВАНО ДЛЯ ТЕСТА В МОНИТОРЕ ПОРТА)
-  uint8_t data103[8] = {0};
-  data103[0] = (uint8_t)(startVolt * 10.0); // 13.8V -> 138;
-  data103[1] = (uint8_t)(doorCounter);
-  // sendRealDashFrame(103, data103);
-
-  // Первый раз нажали - включили пин
-  // Если второй раз не нажали, будем заводить. Если нажали еще один и более раз, заводить не будем
-  if (doorCounter == 0) {
+  Serial2.print(F(" Всего: ")); Serial2.println(++doorCounter);
+  
+  if (doorCounter == 1) {
       realWakeUpDetected = true; 
   }
   if (!realWakeUpDetected) {
-    Serial2.println(F("=======Нажали на открытие 2 и более раз. Идем спать дальше...========"));
     currentState = STATE_SHUTDOWN;
     return;
   } else {
     // Сигнал подтвержден, хозяин открыл машину или завел её
-    Serial2.println(F("=======Нажали 1 раз (или завели авто). Включаем питание Андроид...======"));
+    Serial2.println(F("=======Включаем питание Андроид...========="));
     digitalWrite(PIN_ACC_OUTPUT, HIGH); // ВКЛЮЧАЕМ BTS442 (Магнитолу)
     wakeUpTimerStart = millis();
   }
@@ -261,10 +198,11 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(PIN_SPEED), speedPulseCounter, FALLING);
   
   // Автоматический перебор пинов ламп из массивов кадра 101
-  for (int i = 0; i < LAMPS_COUNT_1; i++) pinMode(indicators1[i].pin, INPUT_PULLUP);
-  for (int i = 0; i < LAMPS_COUNT_2; i++) pinMode(indicators2[i].pin, INPUT_PULLUP);
-  for (int i = 0; i < LAMPS_COUNT_3; i++) pinMode(indicators3[i].pin, INPUT_PULLUP);
-  
+  for (int i = 0; i < INDICATORS_COUNT; i++) pinMode(indicators[i].pin, INPUT_PULLUP);
+
+  Serial.begin(115200);
+  //pinMode(17, INPUT_PULLUP); // Подтяжка RX линии Serial2 
+  delay(100);
 }
 
 void loop() {
@@ -279,7 +217,7 @@ void loop() {
       
     }
 
-    // 2. СТАНДАРТНЫЕ ДАТЧИКИ (CAN ID: 101)
+    // 2. СТАНДАРТНЫЕ ДАТЧИКИ 
     if (currentMillis - timerNormSensors >= INTERVAL_NORM) {
       // Вычисляем точное время, прошедшее с момента последнего расчета
       unsigned long timeElapsed = currentMillis - timerNormSensors;
@@ -295,31 +233,40 @@ void loop() {
 
       // Расчет физических величин
       float calcRPM = ((float)localRpmPulses / pulsesPerTurnRPM) * (60000.0 / timeElapsed);
-      currentRPM = (calcRPM < 0) ? 0 : (uint16_t)calcRPM;
+      currentRPM = (calcRPM < 0) ? 0 : (int)calcRPM;
 
       float calcSpeed = ((float)localSpeedPulses / pulsesPerKmSpeed) / ((float)timeElapsed / 3600000.0);
-      currentSpeed = (calcSpeed < 1.0) ? 0 : (uint16_t)calcSpeed;
-
-      // --- Сборка байта ламп для Кадра 101 ---
+      currentSpeed = (calcSpeed < 1.0) ? 0 : (int)calcSpeed;
+      
+      byteIndicators = 0;
+      textLampsToSerial ="";
+      for (int i = 0; i < INDICATORS_COUNT; i++) {
+        if (digitalRead(indicators[i].pin) == LOW) {
+          byteIndicators |= (1UL << i);
+          textLampsToSerial += indicators[i].name;
+        }
+      }
+      
       // --- Подготовка пакета данных для Кадра 101 ---
-      uint8_t data101[8] = {0};
-      data101[0] = lowByte(currentRPM);
-      data101[1] = highByte(currentRPM);
-      data101[2] = lowByte(currentSpeed);
-      data101[3] = highByte(currentSpeed);
-      data101[4] = createIndicatorsByte(LAMPS_COUNT_1, indicators1); // Байт ламп
-      data101[5] = createIndicatorsByte(LAMPS_COUNT_2, indicators2); // Байт ламп
-      data101[6] = createIndicatorsByte(LAMPS_COUNT_3, indicators3); // Байт ламп
+      uint8_t data3200[8] = {0};
+      memcpy(data3200, &byteIndicators, 4);
+      memcpy(data3200 + 4, &currentRPM, 2);
+      memcpy(data3200 + 6, &currentSpeed, 2);
+      
       // Отправка в RealDash (ВРЕМЕННО ЗАКОММЕНТИРОВАНО ДЛЯ ТЕСТА В МОНИТОРЕ ПОРТА)
-      // sendRealDashFrame(101, data101);
-
+      sendRealDashFrame(3200, data3200);
+      // Serial2.println(" -- 3200 -- ");
+      // for (byte i = 0; i < 8; i++) {
+      //   Serial2.print(data3200[i], BIN);
+      //   Serial2.print(" ");
+      // }
+      // Serial2.println("");
+      
       // Вывод быстрых данных в Монитор порта
       Serial2.print(F(" RPM: ")); Serial2.print(currentRPM);
       Serial2.print(F(" | SPD: ")); Serial2.print(currentSpeed, 1); Serial2.println(F(" km/h"));
-      Serial2.print(F(" LAMPS_1: ")); Serial2.println(createIndicatorsText(LAMPS_COUNT_1, indicators1));
-      Serial2.print(F(" LAMPS_2: ")); Serial2.println(createIndicatorsText(LAMPS_COUNT_2, indicators2));
-      Serial2.print(F(" LAMPS_3: ")); Serial2.println(createIndicatorsText(LAMPS_COUNT_3, indicators3));
-
+      Serial2.print(F(" LAMPS: ")); Serial2.println(textLampsToSerial);
+      
       if (digitalRead(PIN_IGNITION) == LOW)     Serial2.println(F(" [ Зажигание ]")); 
       if (digitalRead(PIN_DOOR_TRIGGER) == LOW) Serial2.println(F(" [ ЦЗ ] "));
     }
@@ -329,9 +276,8 @@ void loop() {
       timerSlowSensors = currentMillis;
       
       // Чтение вольтметра
-      batteryVoltage = readBatteryVoltage(10); 
-      uint8_t voltPacked = (uint8_t)(batteryVoltage * 10.0); // 13.8V -> 138
-
+      int voltPacked = readBatteryVoltageX10(10); 
+      batteryVoltage = voltPacked * 0.1; 
       // Чтение сырого АЦП ДТОЖ (с защитой мультиплексора)
       analogRead(PIN_ECT); 
       int rawSumTemp = 0;
@@ -343,23 +289,26 @@ void loop() {
       int rawSumFuel = 0;
       for(int i = 0; i < 10; i++) rawSumFuel += analogRead(PIN_FUEL);
       rawFuel = rawSumFuel / 10;
-      // --- Подготовка пакета данных для Кадра 102 ---
-      uint8_t data102[8] = {0};
-      data102[0] = lowByte(rawECT);    // ДТОЖ (младший)
-      data102[1] = highByte(rawECT);   // ДТОЖ (старший)
-      data102[2] = lowByte(rawFuel);   // ДУТ (младший)
-      data102[3] = highByte(rawFuel);  // ДУТ (старший)
-      data102[4] = voltPacked;
+      
+      uint8_t data3201[8] = {0};
+      memcpy(data3201, &rawECT, 2);
+      memcpy(data3201 + 2, &rawFuel, 2);
+      memcpy(data3201 + 4, &voltPacked, 1);
+      // Serial2.println(" -- 3201 -- ");
+      // for (byte i = 0; i < 8; i++) {
+      //   Serial2.print(data3201[i], BIN);
+      //   Serial2.print(" ");
+      // }
+      // Serial2.println("");
       // Отправка в RealDash (ВРЕМЕННО ЗАКОММЕНТИРОВАНО ДЛЯ ТЕСТА В МОНИТОРЕ ПОРТА)
-      // sendRealDashFrame(102, data102);
-
-
-      // Вывод медленных данных в Монитор порта
-      Serial2.println(F("----------------------------------------------"));
+      sendRealDashFrame(3201, data3201);
+      
+      //Вывод медленных данных в Монитор порта
+      Serial2.println(F("----------------------------------"));
       Serial2.print(F(" VOLTAGE: ")); Serial2.print(batteryVoltage, 2); Serial2.print(F(" V"));
       Serial2.print(F(" | ДТОЖ ADC: ")); Serial2.print(rawECT); 
       Serial2.print(F(" | ДУТ ADC: ")); Serial2.println(rawFuel);
-      Serial.println(F("----------------------------------------------"));
+      Serial2.println(F("-----------------------------------"));
     }
   }
   // =========================================================================
@@ -373,11 +322,9 @@ void loop() {
     
     case STATE_PRE_DRIVE_WAKE:
       // Ждем зажигания в течение 5 минут
-      // Отправка в RealDash (ВРЕМЕННО ЗАКОММЕНТИРОВАНО ДЛЯ ТЕСТА В МОНИТОРЕ ПОРТА)
-      // sendRealDashFrame(104, { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
       if (isIgnitionOn) {
         currentState = STATE_DRIVE;
-        Serial2.println(F("Состояние изменено на DRIVE. Наслаждайтесь поездкой"));
+       Serial2.println(F("Состояние изменено на DRIVE. Наслаждайтесь поездкой"));
       } 
       else if (millis() - wakeUpTimerStart >= TIMEOUT_WAIT_IGNITION) {
         currentState = STATE_SHUTDOWN;
@@ -386,8 +333,6 @@ void loop() {
       break;
 
     case STATE_DRIVE:
-      // Отправка в RealDash (ВРЕМЕННО ЗАКОММЕНТИРОВАНО ДЛЯ ТЕСТА В МОНИТОРЕ ПОРТА)
-      // sendRealDashFrame(104, { 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
       // В режиме поездки нам плевать на любые клацанья ЦЗ или дверей. Мы смотрим только на зажигание.
       if (!isIgnitionOn) {
         currentState = STATE_SHUTDOWN;
@@ -396,13 +341,11 @@ void loop() {
       break;
 
     case STATE_SHUTDOWN:
-      // Отправка в RealDash (ВРЕМЕННО ЗАКОММЕНТИРОВАНО ДЛЯ ТЕСТА В МОНИТОРЕ ПОРТА)
-      // sendRealDashFrame(104, { 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
       Serial2.println(F("Выключаем питание Андроид..."));
       digitalWrite(PIN_ACC_OUTPUT, LOW); // Обесточиваем магнитолу через BTS442
-      delay(500); // Короткая пауза для записи кэша магнитолы
+      delay(1000); // Короткая пауза для записи кэша магнитолы
       
-      Serial2.println(F("Выключаем саму панель. Пока!"));
+      //Serial2.println(F("Выключаем саму панель. Пока!"));
       digitalWrite(PIN_HOLD_POWER, LOW); // Отпускаем базу BC547B, снимая питание схемы
       
       // ЗАЩИТА: Если палец водителя все еще жмет кнопку ЦЗ, или конденсаторы в сети разряжаются,
@@ -416,49 +359,40 @@ void loop() {
 // <?xml version="1.0" encoding="utf-8"?>
 // <RealDashCAN version="2">
 //   <frames>
-//     <!-- Кадр 101: Обычные датчики и Сигналы по ПЛЮСУ (12V) и МИНУСУ -->
-//     <frame id="101">
-//       <value targetId="37" offset="0" length="2" units="RPM"></value>
-//       <value targetId="33" offset="2" length="2" units="km/h"></value>
-      
-//       <!-- Лампы по ПЛЮСУ -->
-//       <value targetId="163" offset="4" length="1" unit="bit" bit="0"></value> <!-- Левый поворотник -->
-//       <value targetId="164" offset="4" length="1" unit="bit" bit="1"></value> <!-- Правый поворотник -->
-//       <value targetId="157" offset="4" length="1" unit="bit" bit="2"></value> <!-- Дальний свет -->
-//       <value targetId="156" offset="4" length="1" unit="bit" bit="3"></value> <!-- Ближний свет -->
-//       <value targetId="159" offset="4" length="1" unit="bit" bit="4"></value> <!-- Передние ПТФ -->
-//       <value targetId="160" offset="4" length="1" unit="bit" bit="5"></value> <!-- Задний ПТФ -->
-//       <value targetId="158" offset="4" length="1" unit="bit" bit="6"></value> <!-- Габариты -->
-//       <!-- Лампы по МИНУСУ (Часть 1) -->
-//       <value targetId="153" offset="5" length="1" unit="bit" bit="0"></value> <!-- Давление масла -->
-//       <value targetId="155" offset="5" length="1" unit="bit" bit="1"></value> <!-- Ручник / Тормозуха -->
-//       <value targetId="151" offset="5" length="1" unit="bit" bit="2"></value> <!-- Check Engine -->
-//       <value targetId="152" offset="5" length="1" unit="bit" bit="3"></value> <!-- Аккумулятор / Зарядка -->
-//       <value targetId="273" offset="5" length="1" unit="bit" bit="4"></value> <!-- ABS -->
-//       <value targetId="154" offset="5" length="1" unit="bit" bit="5"></value> <!-- Перегрев ОЖ -->
-//       <value targetId="162" offset="5" length="1" unit="bit" bit="6"></value> <!-- Ремень безопасности -->
-//       <value targetId="161" offset="5" length="1" unit="bit" bit="7"></value> <!-- Двери открыты (Общий) -->
-//       <!-- Лампы по МИНУСУ (Часть 2) -->
-//       <value targetId="150" offset="6" length="1" unit="bit" bit="0"></value> <!-- Подушки безопасности (SRS) -->
-//       <value targetId="114" offset="6" length="1" unit="bit" bit="1"></value> <!-- Иммобилайзер (Красный диод) -->
-//       <value name="Indicator: Saw (Electronics)" offset="6" length="1" unit="bit" bit="2"></value> <!-- Пила (Пользовательская) -->
+//     <!-- Кадр 3200: Обычные датчики и cигналы -->
+//     <frame id="3200">
+//       <!-- Лампы по ПЛЮСУ  -->
+//       <value name="Indicator: Turn Signal Left" startbit="0" bitcount="1"></value> <!-- Левый поворотник -->
+//       <value name="Indicator: Turn Signal Right" startbit="1" bitcount="1"></value> <!-- Правый поворотник -->
+//       <value name="Indicator: High Beam" startbit="2" bitcount="1"></value> <!-- Дальний свет -->
+//       <value name="Indicator: Low Beam" startbit="3" bitcount="1"></value> <!-- Ближний свет -->
+//       <value name="Indicator: Front Fog Lights" startbit="4" bitcount="1"></value> <!-- Передние ПТФ -->
+//       <value name="Indicator: Rear Fog Lights" startbit="5" bitcount="1"></value> <!-- Задний ПТФ -->
+//       <value name="Indicator: Parking Lights" startbit="6" bitcount="1"></value> <!-- Габариты -->
+//       <value name="Indicator: P_10" startbit="7" bitcount="1"></value> <!-- Indicator: P_10 -->
 
-//       <!-- Статус системы (занимает байт 1) -->
-//       <value name="System_Status_Id" offset="7" length="1"></value>
+//       <!-- Лампы по МИНУСУ  -->
+//       <value name="Indicator: Oil Pressure" startbit="8" bitcount="1"></value> <!-- Давление масла -->
+//       <value name="Indicator: Hand Brake" startbit="9" bitcount="1"></value> <!-- Ручник / Тормозуха -->
+//       <value name="Indicator: Check Engine" startbit="10" bitcount="1"></value> <!-- Check Engine -->
+//       <value name="Indicator: Battery Charging" startbit="11" bitcount="1"></value> <!-- Аккумулятор / Зарядка -->
+//       <value name="Indicator: ABS Warning" startbit="12" bitcount="1"></value> <!-- ABS -->
+//       <value name="Indicator: Coolant Warning" startbit="13" bitcount="1"></value> <!-- Перегрев ОЖ -->
+//       <value name="Indicator: Seat Belt Warning" startbit="14" bitcount="1"></value> <!-- Ремень безопасности -->
+//       <value name="Indicator: Doors Open" startbit="15" bitcount="1"></value> <!-- Двери открыты (Общий) -->
+//       <value name="Indicator: Airbag Warning" startbit="16" bitcount="1"></value> <!-- Подушки безопасности (SRS) -->
+//       <value name="Indicator: Immobilizer" startbit="17" bitcount="1"></value> <!-- Иммобилайзер (Красный диод) -->
+//       <value name="Indicator: Saw (Electronics)" startbit="18" bitcount="1"></value> <!-- Пила -->
 
+//       <value targetId="37" offset="4" length="2" units="RPM"></value> <!-- ENGINE/ECU INPUTS / RPM - Обороты -->
+//       <value targetId="64" offset="6" length="2" units="km/h"></value> <!-- ENGINE/ECU INPUTS / Vehicle Speed - Скорость -->
 //     </frame>
 
-//     <!-- Кадр 102: Медленные датчики -->
-//     <frame id="102">
-//       <value targetId="14" offset="0" length="2" units="raw"></value>
-//       <value targetId="16" offset="2" length="2" units="raw"></value>
-//       <value targetId="12" offset="4" length="1" conversion="V/10"></value>     
-//     </frame>
-
-//     <!-- Кадр 103: Проверка при старте -->
-//     <frame id="103">
-//       <value name="Start_Voltage" offset="0" length="1" conversion="V/10"></value> 
-//       <value name="Start_Clicks" offset="1" length="2"></value>                    
+//     <!-- Кадр 3201: Медленные датчики -->
+//     <frame id="3201">
+//       <value name="Indicator: Coolant Temperature" offset="0" length="2" conversion="V/1023*90"></value> <!-- ТОЖ Формула временно -->
+//       <value name="Indicator: Fuel Level" offset="2" length="2"> conversion="V/1023*20"></value> <!-- Топливо Формула временно -->
+//       <value name="Indicator: Battery Voltage" offset="4" length="1" conversion="V/10"></value> <!-- Батарея -->  
 //     </frame>
 //   </frames>
 // </RealDashCAN>
@@ -517,49 +451,3 @@ void loop() {
 //   // 3. Отправляем готовый бинарный пакет в UART-свисток
 //   Serial2.write(serialBlock, 20); // 4 (заголовок) + 16 байт данных (кадры 3200-3203 полные, 3204 отправляет первые 2 байта)
 // }
-
-
-// <?xml version="1.0" encoding="utf-8"?>
-// <appIdata version="1">
-//   <!-- Протокол RealDash CAN для Nissan Almera G15 -->
-//   <channels>
-//     <!-- Кадр 3200: Обороты и Скорость -->
-//     <channel id="3200" name="Nissan: RPM" units="RPM" type="value" dataType="uint16"></channel>
-//     <channel id="3200" offset="2" name="Nissan: Speed" units="km/h" type="value" dataType="uint16"></channel>
-
-//     <!-- Кадр 3201: Вольтметр и ДТОЖ -->
-//     <!-- Делим на 100 в RealDash, так как передаем целое число (1226 вместо 12.26) -->
-//     <channel id="3201" name="Nissan: Battery Voltage" units="V" type="value" dataType="uint16" conversion="V/100"></channel>
-//     <channel id="3201" offset="2" name="Nissan: ECT ADC" units="raw" type="value" dataType="uint16"></channel>
-
-//     <!-- Кадр 3202: ДУТ и Дискретные статусы -->
-//     <channel id="3202" name="Nissan: Fuel ADC" units="raw" type="value" dataType="uint16"></channel>
-//     <!-- Битовые маски для зажигания и дверей -->
-//     <channel id="3202" offset="2" name="Nissan: Ignition Status" type="bit" bitIndex="0"></channel>
-//     <channel id="3202" offset="2" name="Nissan: Door Trigger" type="bit" bitIndex="1"></channel>
-
-//     <!-- Кадр 3203: Лампы индикации (Байт 101 и Байт 102) -->
-//     <!-- Группа 101 (PNP ключи) -->
-//     <channel id="3203" name="Indicator: PNP 1" type="bit" bitIndex="0"></channel>
-//     <channel id="3203" name="Indicator: PNP 2" type="bit" bitIndex="1"></channel>
-//     <channel id="3203" name="Indicator: PNP 3" type="bit" bitIndex="2"></channel>
-//     <channel id="3203" name="Indicator: PNP 4" type="bit" bitIndex="3"></channel>
-//     <channel id="3203" name="Indicator: PNP 5" type="bit" bitIndex="4"></channel>
-//     <channel id="3203" name="Indicator: PNP 6" type="bit" bitIndex="5"></channel>
-//     <channel id="3203" name="Indicator: PNP 7" type="bit" bitIndex="6"></channel>
-//     <channel id="3203" name="Indicator: PNP 8" type="bit" bitIndex="7"></channel>
-
-//     <!-- Группа 102 (NPN ключи, смещение на 1 байт дальше в камере) -->
-//     <channel id="3203" offset="1" name="Indicator: NPN 1" type="bit" bitIndex="0"></channel>
-//     <channel id="3203" offset="1" name="Indicator: NPN 2" type="bit" bitIndex="1"></channel>
-//     <channel id="3203" offset="1" name="Indicator: NPN 3" type="bit" bitIndex="2"></channel>
-//     <channel id="3203" offset="1" name="Indicator: NPN 4" type="bit" bitIndex="3"></channel>
-//     <channel id="3203" offset="1" name="Indicator: NPN 5" type="bit" bitIndex="4"></channel>
-//     <channel id="3203" offset="1" name="Indicator: NPN 6" type="bit" bitIndex="5"></channel>
-//     <channel id="3203" offset="1" name="Indicator: NPN 7" type="bit" bitIndex="6"></channel>
-
-//     <!-- Кадр 3204: Мониторинг управляющих выходов -->
-//     <channel id="3204" name="Status: Power Hold" type="bit" bitIndex="0"></channel>
-//     <channel id="3204" name="Status: ACC Output" type="bit" bitIndex="1"></channel>
-//   </channels>
-// </appIdata>
