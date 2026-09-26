@@ -1,186 +1,414 @@
+#include <Arduino.h>
 #include <SPI.h>
 #include <mcp_can.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
-#define ONE_WIRE_BUS 14 // Датчики сидят на цифровом пине 14
+#define ONE_WIRE_BUS 8 // Датчики сидят на цифровом пине 8
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
-
-// Жестко прописываем уникальные ID адреса датчиков
+// Прописываем уникальные ID адреса датчиков
 DeviceAddress interTempSensor = { 0x28, 0x79, 0xF4, 0xC8, 0x00, 0x00, 0x00, 0x8C };
 DeviceAddress outerTempSensor = { 0x28, 0xC5, 0xD7, 0xC9, 0x00, 0x00, 0x00, 0xCF };
 
-// Настройка пинов 
-const int CAN_CS_PIN = 53;     // Пин CS для MCP2515 (на Arduino Mega)
-const int CAN_INT_PIN = 2;     // Пин прерывания INT для MCP2515
-const int HANDBRAKE_PIN = 16;   // Подключение ручника (через оптопару)
-const int TURN_LEFT_PIN = 17;   // Подключение поворотника (через оптопару)
-const int FUEL_PIN = A0;       // Пин ДУТ с фильтром и защитой
+// =========================================================================
+// АВТОМОБИЛЬНЫЙ КОНТРОЛЛЕР ПИТАНИЯ И ДАТЧИКОВ (REALDASH CAN ВЕРСИЯ)
+// Arduino Mega Pro. Посекундные таймеры + Бинарный протокол RealDash CAN
+// =========================================================================                                                                                  
 
-MCP_CAN CAN0(CAN_CS_PIN);       // Инициализация объекта CAN
+// ==========================================================================
+// --- КОНФИГУРАЦИЯ ПИНОВ ---
+// ==========================================================================
+const byte PIN_FUEL = A0;           // ДУТ (резистор 330 Ом)
+const byte PIN_ECT = A1;            // ДТОЖ (резистор 330 Ом)
+const byte PIN_BATTERY_SENSE = A2;  // Вольтметр (делитель 10кОм и 3.3кОм)
+const byte PIN_RPM          = 2;    // Вход RPM через PC817 (Прерывание 0)
+const byte PIN_SPEED        = 3;    // Вход Скорости через PC817 (Прерывание 1)
+const byte PIN_HOLD_POWER   = 4;    // Цифровой выход: удержание питания схемы (на базу BC547B)
+const byte PIN_ACC_OUTPUT   = 5;    // Цифровой выход: управление ключом BTS442 (ACC магнитолы)
+const byte PIN_DOOR_TRIGGER = 6;    // Цифровой вход (через оптопару): сигнал ЦЗ
+const byte PIN_IGNITION     = 7;    // Цифровой вход (через оптопару): Зажигание (Клемма 15)
 
-// Переменные таймера для опроса температуры (чтобы не тормозить CAN-шину)
-unsigned long lastTempRequest = 0;
-const unsigned long tempInterval = 3000; // Опрос температуры раз в 3 секунды
+// ==========================================================================
+// --- СТРУКТУРА И МАССИВЫ ИНДИКАТОРОВ (ЛАМП) ---
+// ==========================================================================
+struct InputChannel {
+  byte pin;            // Номер пина Arduino
+  String name;        // Имя для вывода в Монитор порта
+};
 
-// Переменные для отслеживания изменения состояния входов (защита от спама в порт)
-bool lastHandbrakeState = HIGH;
-bool lastTurnLeftState = HIGH;
+// LAMPS
+const int INDICATORS_COUNT = 19;
+InputChannel indicators[INDICATORS_COUNT] = {
+  {9, "[Левый поворотник] "},
+  {11, "[Правый поворотник] "},
+  {10, "[Дальний свет] "},
+  {23, "[Ближний свет] "},
+  {25, "[Передние ПТФ] "},
+  {27, "[Задний ПТФ] "},
+  {29, "[Габариты] "},
+  {31, "[P_10] "},
+  {32, "[Давление масла] "}, 
+  {34, "[Ручник] "}, 
+  {36, "[Check Engine] "}, 
+  {38, "[Аккумулятор] "}, 
+  {40, "[ABS] "},
+  {42, "[Перегрев ОЖ] "},
+  {44, "[Ремень безопасности] "},
+  {33, "[Двери открыты] "},
+  {35, "[Подушки безопасности] "}, 
+  {37, "[Иммобилайзер] "}, 
+  {39, "[Пила] "}
+};
 
-void setup() {
-  Serial.begin(115200); // Скорость Монитора порта — 115200
-  sensors.begin();
+// ==========================================================================
+// --- ПЕРЕМЕННЫЕ И ТАЙМИНГИ ---
+// ==========================================================================
+const unsigned long TIMEOUT_WAIT_IGNITION = 18000; // Время ожидания зажигания
+const unsigned long WAKE_FILTER_DELAY     = 1000;   // Фильтр сигнала ЦЗ
+const float CRITICAL_BATTERY_VOLTAGE      = 11.7;    // Порог защиты аккумулятора от разряда (Вольты)
 
-  // Настройка пинов для оптопар PC817 (обязательно PULLUP)
-  pinMode(HANDBRAKE_PIN, INPUT_PULLUP);
-  pinMode(TURN_LEFT_PIN, INPUT_PULLUP);
+volatile unsigned long rpmPulses = 0;
+volatile unsigned long speedPulses = 0;
 
-  // Инициализация MCP2515. На Almera G15 скорость шины обычно 500 Кбит/с.
-  // Кварц на плате MCP2515 стоит на 8 МГц.
-  if(CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) == CAN_OK) {
-    Serial.println("MCP2515 успешно запущен!");
-  } else {
-    Serial.println("Ошибка инициализации MCP2515...");
-    while(1); // Останавливаем выполнение при ошибке
+unsigned long timerFastSensors = 0;
+unsigned long timerNormSensors = 0;
+unsigned long timerSlowSensors = 0;
+
+const unsigned long INTERVAL_FAST = 500;  
+const unsigned long INTERVAL_NORM = 1000; 
+const unsigned long INTERVAL_SLOW = 2000; 
+
+// Коэффициенты под Nissan Almera G15
+const int pulsesPerTurnRPM = 2;        
+const float pulsesPerKmSpeed = 6000.0; 
+const float dividerRatio = 4.0523;     // (9,92кОм + 3.25кОм) / 3.25кОм
+
+// Глобальные переменные данных
+unsigned int currentRPM = 0;
+unsigned int currentSpeed = 0;
+uint8_t voltPackedX10 = 0;
+unsigned int rawECT = 0;
+unsigned int rawFuel = 0;
+uint8_t currentInterP40 = 0;
+uint8_t currentOuterP40 = 0;
+uint32_t byteIndicators = 0;
+String textLampsToSerial = "";
+// ==========================================================================
+// --- СОСТОЯНИЕ СИСТЕМЫ ---
+// ==========================================================================
+enum SystemState {
+  STATE_PRE_DRIVE_WAKE,
+  STATE_DRIVE,
+  STATE_SHUTDOWN
+};
+
+SystemState currentState = STATE_PRE_DRIVE_WAKE;
+unsigned long wakeUpTimerStart = 0;
+
+// ==========================================================================
+// --- ФУНКЦИЯ ОТПРАВКИ REALDASH CAN ---
+// ==========================================================================
+void sendRealDashFrame(unsigned long canId, const uint8_t* data8Bytes) {
+  const uint8_t serialBlockHeader[4] = { 0x44, 0x33, 0x22, 0x11 };
+  Serial.write(serialBlockHeader, 4);
+  Serial.write((const uint8_t*)&canId, 4);
+  Serial.write(data8Bytes, 8);
+}
+
+// Функция точного измерения напряжения аккумулятора
+uint8_t readBatteryVoltageX10(int counter) {
+  // 1. ХОЛОСТОЙ ВЫСТРЕЛ (Dummy Read): переключаем АЦП на пин вольтметра
+  // и даем зарядиться внутреннему конденсатору. Результат просто выбрасываем.
+  analogRead(PIN_BATTERY_SENSE); 
+  
+  // 2. Основной цикл сбора данных (уже чистые показания)
+  int rawSum = 0;
+  for (int i = 0; i < counter; i++) {
+    rawSum += analogRead(PIN_BATTERY_SENSE);
   }
   
-  CAN0.setMode(MCP_NORMAL);   // Переводим CAN в рабочий режим
-  pinMode(CAN_INT_PIN, INPUT); 
+  float averageRaw = (float)rawSum / (float)counter;
+  float vPin = ((averageRaw * 5.0) / 1023.0) * dividerRatio;
+  return vPin * 10; 
+}
+// --- ФУНКЦИИ ОБРАБОТКИ ПРЕРЫВАНИЙ ---
+void rpmPulseCounter() {
+  rpmPulses++;
+}
 
-  Serial.println("=== СИСТЕМА ЗАПУЩЕНА И НАДЕЖНО ЗАПИТАНА ПО VIN ===");
+void speedPulseCounter() {
+  speedPulses++;
+}
 
+void setup() {
+  // 1. МГНОВЕННО захватываем питание платы, пока не исчез физический импульс от двери!
+  pinMode(PIN_HOLD_POWER, OUTPUT);
+  digitalWrite(PIN_HOLD_POWER, HIGH); 
+  
+  Serial2.begin(9600);
+  pinMode(17, INPUT_PULLUP); // Подтяжка RX линии Serial2 
+  delay(100);
+  Serial2.println(F("============ ЗАГРУЗКА СИСТЕМЫ ================"));
+  
+  // Инициализация остальных пинов
+  pinMode(PIN_ACC_OUTPUT, OUTPUT);
+  digitalWrite(PIN_ACC_OUTPUT, LOW); // Магнитола пока строго выключена
+  
+  pinMode(PIN_DOOR_TRIGGER, INPUT_PULLUP); // Используем подтяжку для оптопары
+  pinMode(PIN_IGNITION, INPUT_PULLUP);
+
+  // 2. ЭКСПРЕСС-ДИАГНОСТИКА АКБ
+  Serial2.println(F(" ПРОВЕРЯЕМ БАТАРЕЮ И НАЖАТИЕ НА БРЕЛОК ЦЗ"));
+  float batteryVoltage = readBatteryVoltageX10(3) * 0.1;
+  Serial2.print(F(" Батарея: ")); Serial2.print(batteryVoltage); Serial2.println(F("V"));
+  if (batteryVoltage < CRITICAL_BATTERY_VOLTAGE) {
+    Serial2.println(F(" Выключаем питание вообще "));
+    currentState = STATE_SHUTDOWN;
+    return;
+  }
+  
+  // 3. ФИЛЬТР НАЖАТИЙ НА ЦЗ
+  unsigned long filterStart = millis();
+  bool realWakeUpDetected = false;
+  int doorCounter = 1; // Счетчик нажатий, один раз уже нажали
+  bool lastDoorState = HIGH;
+
+  while (millis() - filterStart < WAKE_FILTER_DELAY) {
+    // Если в течение 2 сек включили зажигание — это точно не ложный сигнал
+    if (digitalRead(PIN_IGNITION) == LOW) { 
+      realWakeUpDetected = true; 
+      break; 
+    }
+    bool currentDoorState = digitalRead(PIN_DOOR_TRIGGER);
+    if (currentDoorState == LOW && lastDoorState == HIGH) {
+      doorCounter++; 
+    }
+   lastDoorState = currentDoorState; 
+  }
+  Serial2.print(F(" Всего: ")); Serial2.println(doorCounter);
+  
+  if (doorCounter == 1) {
+      realWakeUpDetected = true; 
+  }
+  if (!realWakeUpDetected) {
+    currentState = STATE_SHUTDOWN;
+    return;
+  } else {
+    // Сигнал подтвержден, хозяин открыл машину или завел её
+    Serial2.println(F(" Включаем питание Андроид..."));
+    digitalWrite(PIN_ACC_OUTPUT, HIGH); // ВКЛЮЧАЕМ BTS442 (Магнитолу)
+    wakeUpTimerStart = millis();
+  }
+  // Настройка ДТОЖ и ДУТ, есть внешняя подтяжка к 5в 1кОм
+  pinMode(PIN_ECT, INPUT); // Для ДТОЖ
+  pinMode(PIN_FUEL, INPUT); // Для ДУТ
+  // Настройка прерываний скорости и оборотов, есть внешняя подтяжка к 5в 1кОм
+  pinMode(PIN_SPEED, INPUT);
+  pinMode(PIN_RPM, INPUT);
+  // Прерывание срабатывает, когда транзистор в PC817 открывается и прижимает пин к GND
+  attachInterrupt(digitalPinToInterrupt(PIN_RPM), rpmPulseCounter, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_SPEED), speedPulseCounter, FALLING);
+  
+  // Автоматический перебор пинов ламп из массивов, внешней подтяжки нет
+  for (int i = 0; i < INDICATORS_COUNT; i++) pinMode(indicators[i].pin, INPUT_PULLUP);
+
+  Serial.begin(115200);
+  sensors.begin();
+  delay(100);
 }
 
 void loop() {
-  // --- 1. ОПРОС ДАТЧИКОВ С ОПТОПАРЫ PC817 (Вывод только при изменении) ---
-  static unsigned long lastDebounceTimeHandbrake = 0;
-  static unsigned long lastDebounceTimeTurn = 0;
-  const unsigned long debounceDelay = 50; // Время фильтрации дребезга (50 мс)
+  // =========================================================================
+  // БЛОК ОТПРАВКИ БИНАРНЫХ ДАННЫХ ПО ТАЙМЕРАМ
+  // =========================================================================
+  if (currentState == STATE_PRE_DRIVE_WAKE || currentState == STATE_DRIVE) {
+    unsigned long currentMillis = millis();
+    // 1. БЫСТРЫЕ ДАТЧИКИ
+    if (currentMillis - timerFastSensors >= INTERVAL_FAST) {
+      // Вычисляем точное время, прошедшее с момента последнего расчета
+      unsigned long timeElapsed = currentMillis - timerNormSensors;
+      timerFastSensors = currentMillis;    
+      
+      // Блокируем прерывания на доли микросекунды, чтобы безопасно скопировать данные
+      noInterrupts();
+      unsigned long localRpmPulses = rpmPulses;
+      unsigned long localSpeedPulses = speedPulses;
+      rpmPulses = 0;     // Сбрасываем счетчик импульсов тахометра
+      speedPulses = 0;   // Сбрасываем счетчик импульсов скорости
+      interrupts();      // Снова разрешаем прерывания
 
-  // Проверка РУЧНИКА
-  bool readingHandbrake = digitalRead(HANDBRAKE_PIN);
-  if (readingHandbrake != lastHandbrakeState) {
-    // Если состояние изменилось, запускаем/сбрасываем таймер
-    if (millis() - lastDebounceTimeHandbrake > debounceDelay) {
-      if (readingHandbrake == LOW) {
-       Serial.println("  [Сигнал]>>> Ручник затянут!");
-      } else {
-       Serial.println("  [Сигнал]>>> Ручник отпущен.");
+      // Расчет физических величин
+      float calcRPM = ((float)localRpmPulses / pulsesPerTurnRPM) * (60000.0 / timeElapsed);
+      currentRPM = (calcRPM < 0) ? 0 : (int)calcRPM;
+
+      float calcSpeed = ((float)localSpeedPulses / pulsesPerKmSpeed) / ((float)timeElapsed / 3600000.0);
+      currentSpeed = (calcSpeed < 1.0) ? 0 : (int)calcSpeed;
+      
+      byteIndicators = 0;
+      textLampsToSerial ="";
+      for (int i = 0; i < INDICATORS_COUNT; i++) {
+        if (digitalRead(indicators[i].pin) == LOW) {
+          byteIndicators |= (1UL << i);
+          textLampsToSerial += indicators[i].name;
+        }
       }
-      lastHandbrakeState = readingHandbrake;
-      lastDebounceTimeHandbrake = millis();
+      
+      // --- Подготовка пакета данных для Кадра 101 ---
+      uint8_t data3200[8] = {0};
+      memcpy(data3200, &byteIndicators, 4);
+      memcpy(data3200 + 4, &currentRPM, 2);
+      memcpy(data3200 + 6, &currentSpeed, 2);
+      
+      // Отправка в RealDash (ВРЕМЕННО ЗАКОММЕНТИРОВАНО ДЛЯ ТЕСТА В МОНИТОРЕ ПОРТА)
+      sendRealDashFrame(3200, data3200);
+           
+      // Вывод быстрых данных в Монитор порта
+      Serial2.print(F(" RPM: ")); Serial2.print(currentRPM);
+      Serial2.print(F(" | SPD: ")); Serial2.print(currentSpeed, 1); Serial2.println(F(" km/h"));
+      Serial2.print(F(" LAMPS: ")); Serial2.println(textLampsToSerial);
+      
+      if (digitalRead(PIN_IGNITION) == LOW)     Serial2.println(F(" [ Зажигание ]")); 
+      if (digitalRead(PIN_DOOR_TRIGGER) == LOW) Serial2.println(F(" [ ЦЗ ] "));
     }
-  } else {
-    lastDebounceTimeHandbrake = millis(); // Сброс таймера, если состояние стабильно
-  }
 
-  // Проверка ПОВОРОТНИКА
-  bool readingTurnLeft = digitalRead(TURN_LEFT_PIN);
-  if (readingTurnLeft != lastTurnLeftState) {
-   if (millis() - lastDebounceTimeTurn > debounceDelay) {
-      if (readingTurnLeft == LOW) {
-        Serial.println("  [Сигнал]>>> Левый поворотник включен!");
-      } else {
-        Serial.println("  [Сигнал]>>> Левый поворотник выключен.");
-     }
-     lastTurnLeftState = readingTurnLeft;
-     lastDebounceTimeTurn = millis();
+    // 2. СТАНДАРТНЫЕ ДАТЧИКИ 
+    if (currentMillis - timerNormSensors >= INTERVAL_NORM) {
+      timerNormSensors = currentMillis;
     }
-  } else {
-    lastDebounceTimeTurn = millis();
-  }
 
-  // --- 2. ЧТЕНИЕ ДАННЫХ ИЗ CAN-ШИНЫ АВТОМОБИЛЯ (Мгновенно) ---
-  if(!digitalRead(CAN_INT_PIN)) { // Если пришел пакет (пин INT упал в LOW)
-    long unsigned int rxId;
-    unsigned char len = 0;
-    unsigned char rxBuf[8];
-    
-    CAN0.readMsgBuf(&rxId, &len, rxBuf); // Читаем данные из буфера
-    
-    // Выводим ID пакета и данные в Serial для анализа
-    Serial.print("CAN ID: 0x");
-    Serial.print(rxId, HEX);
-    Serial.print(" Data: ");
-    for(int i = 0; i < len; i++) {
-      if(rxBuf[i] < 0x10) Serial.print("0"); // Красивый вывод с ведущим нулем
-      Serial.print(rxBuf[i], HEX);
-      Serial.print(" ");
+    // 3. МЕДЛЕННЫЕ ДАТЧИКИ
+    if (currentMillis - timerSlowSensors >= INTERVAL_SLOW) {
+      timerSlowSensors = currentMillis;
+      
+      // Чтение вольтметра
+      voltPackedX10 = readBatteryVoltageX10(10); 
+      float batteryVoltage = voltPackedX10 * 0.1; 
+      // Чтение сырого АЦП ДТОЖ (с защитой мультиплексора)
+      analogRead(PIN_ECT); 
+      int rawSumTemp = 0;
+      for(int i = 0; i < 10; i++) rawSumTemp += analogRead(PIN_ECT);
+      rawECT = rawSumTemp / 10;
+
+      // Чтение сырого АЦП ДУТ (с защитой мультиплексора)
+      analogRead(PIN_FUEL); 
+      int rawSumFuel = 0;
+      for(int i = 0; i < 10; i++) rawSumFuel += analogRead(PIN_FUEL);
+      rawFuel = rawSumFuel / 10;
+
+      sensors.requestTemperatures(); // Запрос у всех датчиков
+
+      // Чтение строго по ID адресам
+      currentInterP40 = sensors.getTempC(interTempSensor) + 40;
+      currentOuterP40 = sensors.getTempC(outerTempSensor) + 40;
+            
+      uint8_t data3201[8] = {0};
+      memcpy(data3201, &rawECT, 2);
+      memcpy(data3201 + 2, &rawFuel, 2);
+      memcpy(data3201 + 4, &voltPackedX10, 1);
+      memcpy(data3201 + 5, &currentInterP40, 1);
+      memcpy(data3201 + 6, &currentOuterP40, 1);
+      
+      // Отправка в RealDash
+      sendRealDashFrame(3201, data3201);
+      
+      //Вывод медленных данных в Монитор порта
+      Serial2.println(F("----------------------------------"));
+      Serial2.print(F(" VOLTAGE: ")); Serial2.print(batteryVoltage, 2); Serial2.print(F(" V"));
+      Serial2.print(F(" | ДТОЖ ADC: ")); Serial2.print(rawECT); 
+      Serial2.print(F(" | ДУТ ADC: ")); Serial2.println(rawFuel);
+      Serial2.print(F(" | Салон: ")); Serial2.print((currentInterP40 - 40), 1); Serial2.println(F(" °C"));
+      Serial2.print(F(" | Улица: ")); Serial2.print((currentOuterP40 - 40), 1); Serial2.println(F(" °C"));
+      Serial2.println(F("-----------------------------------"));
     }
-    Serial.println();
   }
-
-  // --- 3. ЗАПРОС ТЕМПЕРАТУРЫ DS18B20 ПО ТАЙМЕРУ ---
-  if (millis() - lastTempRequest >= tempInterval) {
-    lastTempRequest = millis(); // Сброс таймера
-
-    // Чтение датчика уровня топлива
-    int rawFuel = analogRead(FUEL_PIN); // Считываем АЦП (получим от 0 до ~769)
+  // =========================================================================
+  // АВТОМАТ СОСТОЯНИЙ ПИТАНИЯ
+  // =========================================================================
   
-    // Калибровка под потенциометр B1k и резистор 330 Ом
-    // R1 (330 Ом) и R2 (1000 Ом). Всего 1330 Ом. 
-    // 5в*(1000 Ом/1330 Ом) = 3,76в
-    // 3,76в/5в*1023 = 769 АЦП
-    // 0 Ом (пустой бак) = 0 АЦП. 1000 Ом (полный бак) = 769 АЦП.
-    int fuelPercent = map(rawFuel, 0, 769, 0, 100); 
+  // Оптопара инвертирует сигнал: когда на ней +12В, пин Ардуино притягивается к GND (LOW)
+  bool isIgnitionOn = (digitalRead(PIN_IGNITION) == LOW);
   
-    // Защита от выхода за границы 0-100% (если потенциометр выдаст чуть больше 769)
-    fuelPercent = constrain(fuelPercent, 0, 100); 
+  switch (currentState) {
     
-    sensors.requestTemperatures(); // Запрос у всех датчиков
+    case STATE_PRE_DRIVE_WAKE:
+      // Ждем зажигания в течение 5 минут
+      if (isIgnitionOn) {
+        currentState = STATE_DRIVE;
+       Serial2.println(F("Состояние изменено на DRIVE. Наслаждайтесь поездкой"));
+      } 
+      else if (millis() - wakeUpTimerStart >= TIMEOUT_WAIT_IGNITION) {
+        currentState = STATE_SHUTDOWN;
+        Serial2.println(F("Состояние изменено на SHUTDOWN. Вышло время"));
+      }
+      break;
 
-    // Чтение строго по ID адресам
-    float currentInter = sensors.getTempC(interTempSensor);
-    float currentOuter = sensors.getTempC(outerTempSensor);
+    case STATE_DRIVE:
+      // В режиме поездки нам плевать на любые клацанья ЦЗ или дверей. Мы смотрим только на зажигание.
+      if (!isIgnitionOn) {
+        currentState = STATE_SHUTDOWN;
+        Serial2.println(F("Состояние изменено на SHUTDOWN. Машина выключена"));
+      }
+      break;
 
-    // Статические переменные для хранения ПОСЛЕДНЕГО УСПЕШНОГО значения
-    static float lastValidInter = -127.0; // Стартовое значение по умолчанию
-    static float lastValidOuter = -127.0;
-
-    // Счетчики ошибок для каждого датчика
-    static int errorCountInter = 0;
-    static int errorCountOuter = 0;
-
-    // Фильтр для Мотора: обновляем значение, только если нет ошибки -127
-    if (currentInter != DEVICE_DISCONNECTED_C) {
-      lastValidInter = currentInter;
-      errorCountInter = 0;
-    } else {
-      errorCountInter++;             // Контакт отошел, фиксируем пропуск
-    }
-    
-    // Фильтр для Улицы: обновляем значение, только если нет ошибки -127
-    if (currentOuter != DEVICE_DISCONNECTED_C) {
-      lastValidOuter = currentOuter;
-      errorCountOuter = 0; 
-    } else {
-      errorCountOuter++;             
-    }
-    // Вывод ТЕПЕРЬ ВСЕГДА КРАСИВЫЙ (без -127)
-    Serial.print("  [TEMP] Салон: ");
-     // Если датчик не работает со старта ИЛИ оборван более 3-х раз подряд (9 секунд)
-    if (lastValidInter == -127.0 || errorCountInter >= 3) {
-      Serial.print("ОБРЫВ ПРОВОДА!");
-    } else {
-      Serial.print(lastValidInter, 1);
-      Serial.print(" °C");
-    }
-
-    Serial.print(" | Улица: ");
-    if (lastValidOuter == -127.0 || errorCountOuter >= 3) {
-      Serial.print("ОБРЫВ ПРОВОДА!");
-    } else {
-      Serial.print(lastValidOuter, 1);
-      Serial.print(" °C");
-    }
-
-    // Вывод уровня топлива в Монитор порта
-    Serial.print("  [FUEL] Значение АЦП: ");
-    Serial.print(rawFuel);
-    Serial.print(" из 769 | Уровень в баке: ");
-    Serial.print(fuelPercent);
-    Serial.println(" %");
-    Serial.println();
+    case STATE_SHUTDOWN:
+      Serial2.println(F("Выключаем питание Андроид..."));
+      digitalWrite(PIN_ACC_OUTPUT, LOW); // Обесточиваем магнитолу через BTS442
+      delay(1000); // Короткая пауза для записи кэша магнитолы
+      
+      //Serial2.println(F("Выключаем саму панель. Пока!"));
+      digitalWrite(PIN_HOLD_POWER, LOW); // Отпускаем базу BC547B, снимая питание схемы
+      
+      // ЗАЩИТА: Если палец водителя все еще жмет кнопку ЦЗ, или конденсаторы в сети разряжаются,
+      // крутимся в пустом цикле и ждем полной физической смерти питания, блокируя выполнение кода.
+      while(true) {
+        // Процессор застывает здесь до полного исчезновения напряжения на шине 5V
+      }
+      break;
   }
 }
+// <?xml version="1.0" encoding="utf-8"?>
+// <RealDashCAN version="2">
+//   <frames>
+//     <!-- Кадр 3200: Обычные датчики и cигналы -->
+//     <frame id="3200">
+//       <!-- Лампы по ПЛЮСУ  -->
+//       <value name="Indicator: Turn Signal Left" startbit="0" bitcount="1"></value> <!-- Левый поворотник -->
+//       <value name="Indicator: Turn Signal Right" startbit="1" bitcount="1"></value> <!-- Правый поворотник -->
+//       <value name="Indicator: High Beam" startbit="2" bitcount="1"></value> <!-- Дальний свет -->
+//       <value name="Indicator: Low Beam" startbit="3" bitcount="1"></value> <!-- Ближний свет -->
+//       <value name="Indicator: Front Fog Lights" startbit="4" bitcount="1"></value> <!-- Передние ПТФ -->
+//       <value name="Indicator: Rear Fog Lights" startbit="5" bitcount="1"></value> <!-- Задний ПТФ -->
+//       <value name="Indicator: Parking Lights" startbit="6" bitcount="1"></value> <!-- Габариты -->
+//       <value name="Indicator: P_10" startbit="7" bitcount="1"></value> <!-- Indicator: P_10 -->
+
+//       <!-- Лампы по МИНУСУ  -->
+//       <value name="Indicator: Oil Pressure" startbit="8" bitcount="1"></value> <!-- Давление масла -->
+//       <value name="Indicator: Hand Brake" startbit="9" bitcount="1"></value> <!-- Ручник / Тормозуха -->
+//       <value name="Indicator: Check Engine" startbit="10" bitcount="1"></value> <!-- Check Engine -->
+//       <value name="Indicator: Battery Charging" startbit="11" bitcount="1"></value> <!-- Аккумулятор / Зарядка -->
+//       <value name="Indicator: ABS Warning" startbit="12" bitcount="1"></value> <!-- ABS -->
+//       <value name="Indicator: Coolant Warning" startbit="13" bitcount="1"></value> <!-- Перегрев ОЖ -->
+//       <value name="Indicator: Seat Belt Warning" startbit="14" bitcount="1"></value> <!-- Ремень безопасности -->
+//       <value name="Indicator: Doors Open" startbit="15" bitcount="1"></value> <!-- Двери открыты (Общий) -->
+//       <value name="Indicator: Airbag Warning" startbit="16" bitcount="1"></value> <!-- Подушки безопасности (SRS) -->
+//       <value name="Indicator: Immobilizer" startbit="17" bitcount="1"></value> <!-- Иммобилайзер (Красный диод) -->
+//       <value name="Indicator: Saw (Electronics)" startbit="18" bitcount="1"></value> <!-- Пила -->
+
+//       <value targetId="37" offset="4" length="2" units="RPM"></value> <!-- ENGINE/ECU INPUTS / RPM - Обороты -->
+//       <value targetId="64" offset="6" length="2" units="km/h"></value> <!-- ENGINE/ECU INPUTS / Vehicle Speed - Скорость -->
+//     </frame>
+
+//     <!-- Кадр 3201: Медленные датчики -->
+//     <frame id="3201">
+//       <value name="Indicator: Coolant Temperature" offset="0" length="2" conversion="V/1023*90"></value> <!-- ТОЖ Формула временно -->
+//       <value name="Indicator: Fuel Level" offset="2" length="2"> conversion="V/1023*20"></value> <!-- Топливо Формула временно -->
+//       <value name="Indicator: Battery Voltage" offset="4" length="1" conversion="V/10"></value> <!-- Батарея --> 
+//       <value name="Indicator: Temperature Inter" offset="5" length="1" conversion="V-40"></value> <!-- Температура Салон -->
+//       <value name="Indicator: Temperature Outer" offset="6" length="1" conversion="V-40"></value> <!-- Температура Улица --> 
+//     </frame>
+//   </frames>
+// </RealDashCAN>
+
+// Примечание: Параметр targetId — это внутренний уникальный номер датчика в экосистеме RealDash 
+// (например, 37 — это всегда RPM, а 12 — вольтаж батареи). Полный список этих ID есть на официальном сайте RealDash.
