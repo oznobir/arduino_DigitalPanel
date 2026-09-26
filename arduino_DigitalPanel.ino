@@ -3,6 +3,8 @@
 #include <mcp_can.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <avr/sleep.h>
+#include <avr/power.h>
 
 #define ONE_WIRE_BUS 8 // Датчики сидят на цифровом пине 8
 OneWire oneWire(ONE_WIRE_BUS);
@@ -24,9 +26,8 @@ const byte PIN_ECT = A1;            // ДТОЖ (резистор 330 Ом)
 const byte PIN_BATTERY_SENSE = A2;  // Вольтметр (делитель 10кОм и 3.3кОм)
 const byte PIN_RPM          = 2;    // Вход RPM через PC817 (Прерывание 0)
 const byte PIN_SPEED        = 3;    // Вход Скорости через PC817 (Прерывание 1)
-const byte PIN_HOLD_POWER   = 4;    // Цифровой выход: удержание питания схемы (на базу BC547B)
 const byte PIN_ACC_OUTPUT   = 5;    // Цифровой выход: управление ключом BTS442 (ACC магнитолы)
-const byte PIN_DOOR_TRIGGER = 6;    // Цифровой вход (через оптопару): сигнал ЦЗ
+const byte PIN_DOOR_TRIGGER = 18;    // Цифровой вход (через оптопару): сигнал ЦЗ (Прерывание )
 const byte PIN_IGNITION     = 7;    // Цифровой вход (через оптопару): Зажигание (Клемма 15)
 
 // ==========================================================================
@@ -60,13 +61,27 @@ InputChannel indicators[INDICATORS_COUNT] = {
   {37, "[Иммобилайзер] "}, 
   {39, "[Пила] "}
 };
+// ==========================================================================
+// --- СОСТОЯНИЕ СИСТЕМЫ ---
+// ==========================================================================
+enum SystemState {
+  STATE_SLEEP,
+  STATE_PRE_DRIVE_WAKE,
+  STATE_DRIVE,
+  STATE_SHUTDOWN
+};
 
+SystemState currentState = STATE_SLEEP;
 // ==========================================================================
 // --- ПЕРЕМЕННЫЕ И ТАЙМИНГИ ---
 // ==========================================================================
 const unsigned long TIMEOUT_WAIT_IGNITION = 18000; // Время ожидания зажигания
 const unsigned long WAKE_FILTER_DELAY     = 1000;   // Фильтр сигнала ЦЗ
 const float CRITICAL_BATTERY_VOLTAGE      = 11.7;    // Порог защиты аккумулятора от разряда (Вольты)
+volatile int clickCount = 0;        // Переменная счетчика нажатий ЦЗ (volatile обязателен для прерываний)
+volatile unsigned long lastDebounceTime = 0; 
+const unsigned long debounceDelay = 250;     // Игнорируем помехи короче 250 мс
+unsigned long wakeUpTimerStart = 0;
 
 volatile unsigned long rpmPulses = 0;
 volatile unsigned long speedPulses = 0;
@@ -94,17 +109,6 @@ uint8_t currentInterP40 = 0;
 uint8_t currentOuterP40 = 0;
 uint32_t byteIndicators = 0;
 String textLampsToSerial = "";
-// ==========================================================================
-// --- СОСТОЯНИЕ СИСТЕМЫ ---
-// ==========================================================================
-enum SystemState {
-  STATE_PRE_DRIVE_WAKE,
-  STATE_DRIVE,
-  STATE_SHUTDOWN
-};
-
-SystemState currentState = STATE_PRE_DRIVE_WAKE;
-unsigned long wakeUpTimerStart = 0;
 
 // ==========================================================================
 // --- ФУНКЦИЯ ОТПРАВКИ REALDASH CAN ---
@@ -132,7 +136,39 @@ uint8_t readBatteryVoltageX10(int counter) {
   float vPin = ((averageRaw * 5.0) / 1023.0) * dividerRatio;
   return vPin * 10; 
 }
+
+void goToSleep() {
+  set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+  sleep_enable();
+  
+  ADCSRA &= ~(1 << ADEN); // Отключаем АЦП
+
+  // Привязываем прерывание. Во сне Mega реагирует только на LOW уровень.
+  attachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER), doorTriggerInterrupt, LOW);
+  
+  sleep_mode(); // Засыпаем...
+  
+  // --- ПРОСНУЛИСЬ (от первого клика брелка) ---
+  sleep_disable();
+  
+  // Перенастраиваем прерывание на FALLING (спад сигнала). 
+  // Когда МК уже бодрствует, FALLING работает идеально и точнее считает импульсы.
+  detachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER));
+  attachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER), doorTriggerInterrupt, FALLING);
+  
+  ADCSRA |= (1 << ADEN); // Включаем АЦП обратно
+}
 // --- ФУНКЦИИ ОБРАБОТКИ ПРЕРЫВАНИЙ ---
+// Обработчик прерывания (должен быть максимально коротким!)
+void doorTriggerInterrupt() {
+  unsigned long currentTime = millis();
+  // Защита от дребезга контактов и наводок
+  if (currentTime - lastDebounceTime > debounceDelay) {
+    clickCount++;
+    lastDebounceTime = currentTime;
+  }
+}
+
 void rpmPulseCounter() {
   rpmPulses++;
 }
@@ -143,8 +179,8 @@ void speedPulseCounter() {
 
 void setup() {
   // 1. МГНОВЕННО захватываем питание платы, пока не исчез физический импульс от двери!
-  pinMode(PIN_HOLD_POWER, OUTPUT);
-  digitalWrite(PIN_HOLD_POWER, HIGH); 
+  // pinMode(PIN_HOLD_POWER, OUTPUT);
+  // digitalWrite(PIN_HOLD_POWER, HIGH); 
   
   Serial2.begin(9600);
   pinMode(17, INPUT_PULLUP); // Подтяжка RX линии Serial2 
@@ -158,48 +194,6 @@ void setup() {
   pinMode(PIN_DOOR_TRIGGER, INPUT_PULLUP); // Используем подтяжку для оптопары
   pinMode(PIN_IGNITION, INPUT_PULLUP);
 
-  // 2. ЭКСПРЕСС-ДИАГНОСТИКА АКБ
-  Serial2.println(F(" ПРОВЕРЯЕМ БАТАРЕЮ И НАЖАТИЕ НА БРЕЛОК ЦЗ"));
-  float batteryVoltage = readBatteryVoltageX10(3) * 0.1;
-  Serial2.print(F(" Батарея: ")); Serial2.print(batteryVoltage); Serial2.println(F("V"));
-  if (batteryVoltage < CRITICAL_BATTERY_VOLTAGE) {
-    Serial2.println(F(" Выключаем питание вообще "));
-    currentState = STATE_SHUTDOWN;
-    return;
-  }
-  
-  // 3. ФИЛЬТР НАЖАТИЙ НА ЦЗ
-  unsigned long filterStart = millis();
-  bool realWakeUpDetected = false;
-  int doorCounter = 1; // Счетчик нажатий, один раз уже нажали
-  bool lastDoorState = HIGH;
-
-  while (millis() - filterStart < WAKE_FILTER_DELAY) {
-    // Если в течение 2 сек включили зажигание — это точно не ложный сигнал
-    if (digitalRead(PIN_IGNITION) == LOW) { 
-      realWakeUpDetected = true; 
-      break; 
-    }
-    bool currentDoorState = digitalRead(PIN_DOOR_TRIGGER);
-    if (currentDoorState == LOW && lastDoorState == HIGH) {
-      doorCounter++; 
-    }
-   lastDoorState = currentDoorState; 
-  }
-  Serial2.print(F(" Всего: ")); Serial2.println(doorCounter);
-  
-  if (doorCounter == 1) {
-      realWakeUpDetected = true; 
-  }
-  if (!realWakeUpDetected) {
-    currentState = STATE_SHUTDOWN;
-    return;
-  } else {
-    // Сигнал подтвержден, хозяин открыл машину или завел её
-    Serial2.println(F(" Включаем питание Андроид..."));
-    digitalWrite(PIN_ACC_OUTPUT, HIGH); // ВКЛЮЧАЕМ BTS442 (Магнитолу)
-    wakeUpTimerStart = millis();
-  }
   // Настройка ДТОЖ и ДУТ, есть внешняя подтяжка к 5в 1кОм
   pinMode(PIN_ECT, INPUT); // Для ДТОЖ
   pinMode(PIN_FUEL, INPUT); // Для ДУТ
@@ -332,7 +326,8 @@ void loop() {
   switch (currentState) {
     
     case STATE_PRE_DRIVE_WAKE:
-      // Ждем зажигания в течение 5 минут
+      
+      // Ждем зажигания в течение минут
       if (isIgnitionOn) {
         currentState = STATE_DRIVE;
        Serial2.println(F("Состояние изменено на DRIVE. Наслаждайтесь поездкой"));
@@ -341,6 +336,7 @@ void loop() {
         currentState = STATE_SHUTDOWN;
         Serial2.println(F("Состояние изменено на SHUTDOWN. Вышло время"));
       }
+      
       break;
 
     case STATE_DRIVE:
@@ -356,14 +352,49 @@ void loop() {
       digitalWrite(PIN_ACC_OUTPUT, LOW); // Обесточиваем магнитолу через BTS442
       delay(1000); // Короткая пауза для записи кэша магнитолы
       
-      //Serial2.println(F("Выключаем саму панель. Пока!"));
-      digitalWrite(PIN_HOLD_POWER, LOW); // Отпускаем базу BC547B, снимая питание схемы
+      Serial2.println(F("Состояние изменено на SLEEP!"));
+      currentState = STATE_SLEEP;
+    
+      break;
       
-      // ЗАЩИТА: Если палец водителя все еще жмет кнопку ЦЗ, или конденсаторы в сети разряжаются,
-      // крутимся в пустом цикле и ждем полной физической смерти питания, блокируя выполнение кода.
-      while(true) {
-        // Процессор застывает здесь до полного исчезновения напряжения на шине 5V
+    case STATE_SLEEP:
+      if (clickCount > 0) {
+        // Открываем временное "окно" в 1 сек, чтобы подождать возможные другие нажатия ЦЗ
+        unsigned long windowTimer = millis();
+        int currentClicks = clickCount;
+    
+        while (millis() - windowTimer < WAKE_FILTER_DELAY) {
+        // Если во время ожидания кликнули еще раз — обновляем локальную переменную
+          if (clickCount != currentClicks) {
+            currentClicks = clickCount;
+            windowTimer = millis(); // сбрасываем 1 сек для возможности следующего клика
+          }
+        }
+        // --- ВРЕМЯ ВЫШЛО. Анализируем количество нажатий ---
+    
+        if (currentClicks == 1) {
+          // Действие на один клик — запускаем Андроид, если более - идем снова спать
+          Serial2.println(F(" Включаем питание Андроид..."));
+          digitalWrite(PIN_ACC_OUTPUT, HIGH); // ВКЛЮЧАЕМ BTS442 (Магнитолу)
+          
+          currentState = STATE_PRE_DRIVE_WAKE;
+          wakeUpTimerStart = millis();
+
+          Serial2.println(F(" ПРОВЕРЯЕМ БАТАРЕЮ "));
+          float batteryVoltage = readBatteryVoltageX10(3) * 0.1;
+          Serial2.print(F(" Батарея: ")); Serial2.print(batteryVoltage); Serial2.println(F("V"));
+          if (batteryVoltage < CRITICAL_BATTERY_VOLTAGE) {
+              Serial2.println(F(" Выключаем питание вообще "));
+              currentState = STATE_SHUTDOWN;
+          }
+        }
+    
+        // Сбрасываем счетчик перед тем как снова уснуть
+        clickCount = 0;
       }
+
+      // Если всё отработано — уходим в глубокий сон
+      goToSleep();
       break;
   }
 }
