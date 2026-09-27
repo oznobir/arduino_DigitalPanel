@@ -72,7 +72,7 @@ enum SystemState {
   STATE_SHUTDOWN
 };
 
-SystemState currentState = STATE_SLEEP;
+SystemState currentState = STATE_PRE_DRIVE_WAKE; // 
 // ==========================================================================
 // --- ПЕРЕМЕННЫЕ И ТАЙМИНГИ ---
 // ==========================================================================
@@ -139,37 +139,6 @@ uint8_t readBatteryVoltageX10(int counter) {
   float vPin = ((averageRaw * 5.0) / 1023.0) * dividerRatio;
   return vPin * 10; 
 }
-
-void goToSleep() {
-  
-  set_sleep_mode(SLEEP_MODE_PWR_DOWN);
-  sleep_enable();
-  
-  ADCSRA &= ~(1 << ADEN); // Отключаем АЦП
-
-  // Настраиваем прерывания
-  // attachInterrupt(digitalPinToInterrupt(PIN_IGNITION), wakeUpISR, LOW);
-  attachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER), doorTriggerInterrupt, LOW);
-
-  // Настраиваем Watchdog на пробуждение каждые 1 секунду (для хода часов)
-  MCUSR &= ~(1 << WDRF);
-  WDTCSR |= (1 << WDCE) | (1 << WDE);
-  WDTCSR = (1 << WDIE) | (1 << WDP2) | (1 << WDP1); // 1 секунда
-  wdt_reset();
-  
-  sleep_mode(); // Засыпаем...
-  
-  // --- ПРОСНУЛИСЬ (от первого клика брелка) ---
-  sleep_disable();
-  
-  // Перенастраиваем прерывание на FALLING (спад сигнала). 
-  // Когда МК уже бодрствует, FALLING работает идеально и точнее считает импульсы.
-  // detachInterrupt(digitalPinToInterrupt(PIN_IGNITION));
-  detachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER));
-  attachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER), doorTriggerInterrupt, FALLING);
-  
-  ADCSRA |= (1 << ADEN); // Включаем АЦП обратно
-}
 // --- ФУНКЦИИ ОБРАБОТКИ ПРЕРЫВАНИЙ ---
 // Обработчик прерывания (должен быть максимально коротким!)
 void doorTriggerInterrupt() {
@@ -194,11 +163,25 @@ void rpmPulseCounter() {
 void speedPulseCounter() {
   speedPulses++;
 }
-
+// Настройка Watchdog на режим прерываний (Interrupt Mode) на 1 секунду
+void setup_WDT() {
+  cli(); // Запрещаем прерывания на время настройки
+  
+  wdt_reset();
+  // Разрешаем изменение битов конфигурации WDT
+  // MCUSR &= ~(1 << WDRF);
+  WDTCSR |= (1 << WDCE) | (1 << WDE);
+  // Настраиваем таймер на 1 секунду + включаем режим прерываний (а не перезагрузки!)
+  // Для 1 секунды: WDP2=1, WDP1=1, WDP0=0. WDIE=1 (прерывание)
+  WDTCSR = (1 << WDIE) | (1 << WDP2) | (1 << WDP1);
+  
+  sei(); // Разрешаем прерывания обратно
+}
 void setup() {
   // Установка стартового времени вручную (Часы, Минуты, Секунды, День, Месяц, Год)
   // В будущем Tanix сможет обновить это время через UART при старте
   setTime(12, 0, 0, 27, 9, 2026);
+  setup_WDT(); // Настройка Watchdog
 
   Serial2.begin(9600);
   pinMode(17, INPUT_PULLUP); // Подтяжка RX линии Serial2 
@@ -348,6 +331,7 @@ void loop() {
     
     case STATE_PRE_DRIVE_WAKE:
       if (digitalRead(PIN_ACC_OUTPUT) == LOW) digitalWrite(PIN_ACC_OUTPUT, HIGH);
+      wdt_disable();
       // Ждем зажигания в течение минут
       if (isIgnitionOn) {
         currentState = STATE_DRIVE;
@@ -362,6 +346,7 @@ void loop() {
 
     case STATE_DRIVE:
       if (digitalRead(PIN_ACC_OUTPUT) == LOW) digitalWrite(PIN_ACC_OUTPUT, HIGH);
+      wdt_disable();
       // В режиме поездки нам плевать на любые клацанья ЦЗ или дверей. Мы смотрим только на зажигание.
       if (!isIgnitionOn) {
         currentState = STATE_SHUTDOWN;
@@ -376,12 +361,42 @@ void loop() {
       
       Serial2.println(F("Состояние изменено на SLEEP!"));
       currentState = STATE_SLEEP;
-      clickCount = 0;
     
       break;
 
     case STATE_SLEEP:
-      // 1. АНАЛИЗ КЛИКОВ (если проснулись по ЦЗ)
+      clickCount = 0;
+      // ЦИКЛ ГЛУБОКОГО СНА 
+      set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+      sleep_enable();
+  
+      ADCSRA &= ~(1 << ADEN); // Отключаем АЦП
+
+      // Настраиваем прерывания
+      // attachInterrupt(digitalPinToInterrupt(PIN_IGNITION), wakeUpISR, LOW);
+      attachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER), doorTriggerInterrupt, LOW);
+
+      wdt_reset();
+  
+      sleep_mode(); // Засыпаем...
+  
+        // --- ПРОСНУЛИСЬ (от первого клика брелка или Watchdog) ---
+      sleep_disable();
+  
+      // Перенастраиваем прерывание на FALLING (спад сигнала). 
+      // Когда МК уже бодрствует, FALLING работает идеально и точнее считает импульсы.
+      //detachInterrupt(digitalPinToInterrupt(PIN_IGNITION));
+      detachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER));
+      attachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER), doorTriggerInterrupt, FALLING);
+  
+      ADCSRA |= (1 << ADEN); // Включаем АЦП обратно
+      
+      // Ход часов от Watchdog (1 секунда)
+      if (wdtFired) {
+        wdtFired = false;
+        adjustTime(1); 
+      }
+      
       if (clickCount > 0) {
         unsigned long windowTimer = millis();
         int currentClicks = clickCount;
@@ -400,38 +415,21 @@ void loop() {
           if (batteryVoltage > CRITICAL_BATTERY_VOLTAGE) {
               digitalWrite(PIN_ACC_OUTPUT, HIGH); // ВКЛЮЧАЕМ BTS442
               currentState = STATE_PRE_DRIVE_WAKE;
-              wdt_disable();
               wakeUpTimerStart = millis();
+          } else { 
+            Serial2.println(F("Батарея разряжена..."));  
           }
-        } 
-        else {
-          // 2 и более КЛИКОВ = Просто пришли забрать вещи. 
-          // Оставляем BTS442 выключенным, сбрасываем счетчик и loop() отправит нас обратно в сон
-          clickCount = 0; 
-        }
-        
-        // Выходим из loop(), чтобы обновить состояния автомата и не провалиться в while ниже
-        return; 
-      }
-      
-      // 2. ЦИКЛ ГЛУБОКОГО СНА (если зажигания нет и кликов нет)
-      while (digitalRead(PIN_IGNITION) == HIGH && clickCount == 0) {
-        goToSleep();
-      
-        // Ход часов от Watchdog (1 секунда)
-        if (wdtFired) {
-          wdtFired = false;
-          adjustTime(1); 
-        }
+        }   
       }
       
       // Если проснулись от ключа зажигания, минуя ЦЗ (например, сидели внутри машины)
-      if (digitalRead(PIN_IGNITION) == LOW) { 
-        currentState = STATE_DRIVE;
-        wdt_disable();
-      }
-      
-      break;
+      // if (digitalRead(PIN_IGNITION) == LOW) { 
+      //   currentState = STATE_DRIVE;
+      //   
+      // }
+      // detachInterrupt(digitalPinToInterrupt(PIN_IGNITION));
+      detachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER));
+    break;
   }
 }
 // <?xml version="1.0" encoding="utf-8"?>
