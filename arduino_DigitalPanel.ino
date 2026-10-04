@@ -12,7 +12,7 @@
 // АВТОМОБИЛЬНЫЙ КОНТРОЛЛЕР ПИТАНИЯ И ДАТЧИКОВ (REALDASH CAN ВЕРСИЯ)
 // Arduino Mega Pro. Посекундные таймеры + Бинарный протокол RealDash CAN
 // =========================================================================                                                                                  
-#define ONE_WIRE_BUS 8 // Датчики сидят на цифровом пине 8
+#define ONE_WIRE_BUS 5 // Датчики сидят на цифровом пине 5
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 // Прописываем уникальные ID адреса датчиков
@@ -27,9 +27,9 @@ const byte PIN_ECT = A1;            // ДТОЖ (резистор 330 Ом)
 const byte PIN_BATTERY_SENSE = A2;  // Вольтметр (делитель 10кОм и 3.3кОм)
 const byte PIN_RPM          = 2;    // Вход RPM через PC817 (Прерывание 0)
 const byte PIN_SPEED        = 3;    // Вход Скорости через PC817 (Прерывание 1)
-const byte PIN_ACC_OUTPUT   = 5;    // Цифровой выход: управление ключом BTS442 (ACC магнитолы)
-const byte PIN_DOOR_TRIGGER = 19;    // Цифровой вход (через оптопару): сигнал ЦЗ (Прерывание )
-const byte PIN_IGNITION     = 7;    // Цифровой вход (через оптопару): Зажигание (Клемма 15)
+const byte PIN_ACC_OUTPUT   = 4;    // Цифровой выход: управление ключом BTS442 (ACC магнитолы)
+const byte PIN_DOOR_TRIGGER = 18;    // Цифровой вход (через оптопару): сигнал ЦЗ (Прерывание при включении)
+const byte PIN_IGNITION     = 19;    // Цифровой вход (через оптопару): Зажигание (Клемма 15) (Прерывание при включении)
 
 // ==========================================================================
 // --- СТРУКТУРА И МАССИВЫ ИНДИКАТОРОВ (ЛАМП) ---
@@ -42,14 +42,14 @@ struct InputChannel {
 // LAMPS
 const int INDICATORS_COUNT = 19;
 InputChannel indicators[INDICATORS_COUNT] = {
+  {7, "[P_10] "},
   {9, "[Левый поворотник] "},
   {11, "[Правый поворотник] "},
-  {10, "[Дальний свет] "},
-  {23, "[Ближний свет] "},
-  {25, "[Передние ПТФ] "},
-  {27, "[Задний ПТФ] "},
-  {29, "[Габариты] "},
-  {31, "[P_10] "},
+  {23, "[Дальний свет] "},
+  {25, "[Ближний свет] "},
+  {27, "[Передние ПТФ] "},
+  {29, "[Задний ПТФ] "},
+  {31, "[Габариты] "},
   {32, "[Давление масла] "}, 
   {34, "[Ручник] "}, 
   {36, "[Check Engine] "}, 
@@ -82,7 +82,8 @@ const float CRITICAL_BATTERY_VOLTAGE      = 11.7;    // Порог защиты 
 const unsigned long DEBOUNCE_DELAY = 250;     // Игнорируем помехи короче 250 мс
 volatile int clickCount = 0;        // Переменная счетчика нажатий ЦЗ (volatile обязателен для прерываний)
 volatile unsigned long lastDebounceTime = 0; 
-volatile bool wdtFired = false;             // Флаг того, что проснулись по таймеру
+volatile bool wakeUpIgnition = false;       // Флаг того, что проснулись от зажигания
+volatile unsigned long sleepSecondsCount = 0;
 
 unsigned long wakeUpTimerStart = 0;
 
@@ -149,12 +150,12 @@ void doorTriggerInterrupt() {
     lastDebounceTime = currentTime;
   }
 }
-// void wakeUpISR() {
-//   // Пустой обработчик для зажигания
-// }
-// Прерывание сторожевого таймера (срабатывает раз в секунду во сне)
+void wakeUpISR() {
+  wakeUpIgnition = true;
+}
+//Прерывание сторожевого таймера (срабатывает раз в секунду во сне)
 ISR(WDT_vect) {
-  wdtFired = true; // Поднимаем флаг, что нужно прибавить секунду
+  sleepSecondsCount++;
 }
 void rpmPulseCounter() {
   rpmPulses++;
@@ -164,24 +165,25 @@ void speedPulseCounter() {
   speedPulses++;
 }
 // Настройка Watchdog на режим прерываний (Interrupt Mode) на 1 секунду
-void setup_WDT() {
-  cli(); // Запрещаем прерывания на время настройки
-  
-  wdt_reset();
-  // Разрешаем изменение битов конфигурации WDT
-  // MCUSR &= ~(1 << WDRF);
-  WDTCSR |= (1 << WDCE) | (1 << WDE);
-  // Настраиваем таймер на 1 секунду + включаем режим прерываний (а не перезагрузки!)
-  // Для 1 секунды: WDP2=1, WDP1=1, WDP0=0. WDIE=1 (прерывание)
-  WDTCSR = (1 << WDIE) | (1 << WDP2) | (1 << WDP1);
-  
-  sei(); // Разрешаем прерывания обратно
-}
+// void setup_WDT(uint8_t timeout) {
+//   cli(); // Запрещаем прерывания на время настройки
+//   wdt_reset();
+//   // Разрешаем изменение битов конфигурации WDT
+//   // MCUSR &= ~(1 << WDRF);
+//   WDTCSR |= (1 << WDCE) | (1 << WDE);
+//   // Настраиваем таймер на 1 секунду + включаем режим прерываний (а не перезагрузки!)
+//   // Для 1 секунды: WDP2=1, WDP1=1, WDP0=0. WDIE=1 (прерывание)
+//   // WDTCSR = (1 << WDIE) | (1 << WDP2) | (1 << WDP1);
+//   WDTCSR = (1 << WDIE) | (timeout & 0x07);
+//   if (timeout > 7) WDTCSR |= (1 << WDP3);
+//   sei(); // Разрешаем прерывания обратно
+// }
 void setup() {
   // Установка стартового времени вручную (Часы, Минуты, Секунды, День, Месяц, Год)
   // В будущем Tanix сможет обновить это время через UART при старте
-  setTime(12, 0, 0, 27, 9, 2026);
-  setup_WDT(); // Настройка Watchdog
+  setTime(12, 0, 0, 5, 10, 2026);
+
+  // setup_WDT(WDTO_1S); // Настройка Watchdog
 
   Serial2.begin(9600);
   pinMode(17, INPUT_PULLUP); // Подтяжка RX линии Serial2 
@@ -194,9 +196,9 @@ void setup() {
   pinMode(PIN_DOOR_TRIGGER, INPUT_PULLUP); // Используем подтяжку для оптопары
   pinMode(PIN_IGNITION, INPUT_PULLUP);
 
-  // Настройка ДТОЖ и ДУТ, есть внешняя подтяжка к 5в 1кОм
-  pinMode(PIN_ECT, INPUT); // Для ДТОЖ
-  pinMode(PIN_FUEL, INPUT); // Для ДУТ
+  // Настройка ДТОЖ и ДУТ
+  pinMode(PIN_ECT, INPUT_PULLUP); // Для ДТОЖ
+  pinMode(PIN_FUEL, INPUT_PULLUP); // Для ДУТ
   // Настройка прерываний скорости и оборотов, есть внешняя подтяжка к 5в 1кОм
   pinMode(PIN_SPEED, INPUT);
   pinMode(PIN_RPM, INPUT);
@@ -260,7 +262,7 @@ void loop() {
       sendRealDashFrame(3200, data3200);
            
       // Вывод быстрых данных в Монитор порта
-      Serial2.print(hour()); Serial2.print(":"); Serial2.println(minute());
+      Serial2.print(hour()); Serial2.print(":"); Serial2.print(minute());Serial2.print(":"); Serial2.println(second());
       Serial2.print(F(" RPM: ")); Serial2.print(currentRPM);
       Serial2.print(F(" | SPD: ")); Serial2.print(currentSpeed, 1); Serial2.println(F(" km/h"));
       Serial2.print(F(" LAMPS: ")); Serial2.println(textLampsToSerial);
@@ -311,7 +313,7 @@ void loop() {
       
       //Вывод медленных данных в Монитор порта
       Serial2.println(F("----------------------------------"));
-      Serial2.print(hour()); Serial2.print(":"); Serial2.println(minute());
+      Serial2.print(hour()); Serial2.print(":"); Serial2.print(minute());Serial2.print(":"); Serial2.println(second());
       Serial2.print(F(" VOLTAGE: ")); Serial2.print(batteryVoltage, 2); Serial2.print(F(" V"));
       Serial2.print(F(" | ДТОЖ ADC: ")); Serial2.print(rawECT); 
       Serial2.print(F(" | ДУТ ADC: ")); Serial2.println(rawFuel);
@@ -331,7 +333,7 @@ void loop() {
     
     case STATE_PRE_DRIVE_WAKE:
       if (digitalRead(PIN_ACC_OUTPUT) == LOW) digitalWrite(PIN_ACC_OUTPUT, HIGH);
-      wdt_disable();
+    
       // Ждем зажигания в течение минут
       if (isIgnitionOn) {
         currentState = STATE_DRIVE;
@@ -346,7 +348,7 @@ void loop() {
 
     case STATE_DRIVE:
       if (digitalRead(PIN_ACC_OUTPUT) == LOW) digitalWrite(PIN_ACC_OUTPUT, HIGH);
-      wdt_disable();
+      // wdt_disable();
       // В режиме поездки нам плевать на любые клацанья ЦЗ или дверей. Мы смотрим только на зажигание.
       if (!isIgnitionOn) {
         currentState = STATE_SHUTDOWN;
@@ -361,42 +363,59 @@ void loop() {
       
       Serial2.println(F("Состояние изменено на SLEEP!"));
       currentState = STATE_SLEEP;
-    
+      
       break;
 
     case STATE_SLEEP:
+      // Serial2.println(F("Готовимся ко сну...."));
+      // Сбрасываем счетчик секунд сна перед погружением
+      sleepSecondsCount = 0;
       clickCount = 0;
-      // ЦИКЛ ГЛУБОКОГО СНА 
-      set_sleep_mode(SLEEP_MODE_PWR_DOWN);
-      sleep_enable();
-  
+      // Настраиваем прерывания
+      attachInterrupt(digitalPinToInterrupt(PIN_IGNITION), wakeUpISR, LOW);
+      attachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER), doorTriggerInterrupt, LOW);
+      byte old_ADCSRA = ADCSRA; // Сохраняем настройки АЦП
       ADCSRA &= ~(1 << ADEN); // Отключаем АЦП
 
-      // Настраиваем прерывания
-      // attachInterrupt(digitalPinToInterrupt(PIN_IGNITION), wakeUpISR, LOW);
-      attachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER), doorTriggerInterrupt, LOW);
+      // ЦИКЛ ГЛУБОКОГО СНА 
+      while (!wakeUpIgnition && clickCount == 0) {
+        
+        wdt_enable(WDTO_1S); //Задаем интервал сторожевого таймера
+        WDTCSR |= (1 << WDIE); //Устанавливаем бит WDIE регистра WDTCSR для разрешения прерываний от сторожевого таймера
+        set_sleep_mode(SLEEP_MODE_PWR_DOWN);
 
-      wdt_reset();
-  
-      sleep_mode(); // Засыпаем...
-  
-        // --- ПРОСНУЛИСЬ (от первого клика брелка или Watchdog) ---
-      sleep_disable();
-  
+        // sleep_enable();
+        // Отключаем детектор просадки напряжения (BOD) ради экономии (опционально)
+        // Работает на оригинальных AVR, экономит около 20-25 мкА
+        // #if defined(MCUCR) && defined(BODS) && defined(BODSE)
+          // MCUCR |= (1 << BODS) | (1 << BODSE);
+          // MCUCR = (MCUCR & ~(1 << BODSE)) | (1 << BODS);
+        // #endif
+        // sleep_cpu(); // Засыпаем...
+
+        sleep_mode();
+        
+        // --- ПРОСНУЛИСЬ (от первого клика брелка, зажигания или Watchdog) ---
+        wdt_disable();
+        sleep_disable();
+      }
+      // sleep_disable();
+      // ADCSRA |= (1 << ADEN); // Включаем АЦП обратно
+      ADCSRA = old_ADCSRA;     // Включаем АЦП обратно (восстанавливаем настройки)
       // Перенастраиваем прерывание на FALLING (спад сигнала). 
       // Когда МК уже бодрствует, FALLING работает идеально и точнее считает импульсы.
-      //detachInterrupt(digitalPinToInterrupt(PIN_IGNITION));
+      detachInterrupt(digitalPinToInterrupt(PIN_IGNITION));
       detachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER));
       attachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER), doorTriggerInterrupt, FALLING);
-  
-      ADCSRA |= (1 << ADEN); // Включаем АЦП обратно
+      // Корректируем время в TimeLib на то количество секунд, что мы спали
+      adjustTime(sleepSecondsCount);
+      // Serial2.println(F("Просыпаемся от зажигания или нажатия ЦЗ на брелке..."));
       
-      // Ход часов от Watchdog (1 секунда)
-      if (wdtFired) {
-        wdtFired = false;
-        adjustTime(1); 
+      if (wakeUpIgnition) {
+        wakeUpIgnition = false;
+        currentState = STATE_DRIVE;
+        Serial2.println(F("Появилось зажигание. Состояние изменено на DRIVE. Наслаждайтесь поездкой"));
       }
-      
       if (clickCount > 0) {
         unsigned long windowTimer = millis();
         int currentClicks = clickCount;
@@ -438,14 +457,14 @@ void loop() {
 //     <!-- Кадр 3200: Обычные датчики и cигналы -->
 //     <frame id="3200">
 //       <!-- Лампы по ПЛЮСУ  -->
-//       <value name="Indicator: Turn Signal Left" startbit="0" bitcount="1"></value> <!-- Левый поворотник -->
-//       <value name="Indicator: Turn Signal Right" startbit="1" bitcount="1"></value> <!-- Правый поворотник -->
-//       <value name="Indicator: High Beam" startbit="2" bitcount="1"></value> <!-- Дальний свет -->
-//       <value name="Indicator: Low Beam" startbit="3" bitcount="1"></value> <!-- Ближний свет -->
-//       <value name="Indicator: Front Fog Lights" startbit="4" bitcount="1"></value> <!-- Передние ПТФ -->
-//       <value name="Indicator: Rear Fog Lights" startbit="5" bitcount="1"></value> <!-- Задний ПТФ -->
-//       <value name="Indicator: Parking Lights" startbit="6" bitcount="1"></value> <!-- Габариты -->
-//       <value name="Indicator: P_10" startbit="7" bitcount="1"></value> <!-- Indicator: P_10 -->
+//       <value name="Indicator: P_10" startbit="0" bitcount="1"></value> <!-- Indicator: P_10 -->
+//       <value name="Indicator: Turn Signal Left" startbit="1" bitcount="1"></value> <!-- Левый поворотник -->
+//       <value name="Indicator: Turn Signal Right" startbit="2" bitcount="1"></value> <!-- Правый поворотник -->
+//       <value name="Indicator: High Beam" startbit="3" bitcount="1"></value> <!-- Дальний свет -->
+//       <value name="Indicator: Low Beam" startbit="4" bitcount="1"></value> <!-- Ближний свет -->
+//       <value name="Indicator: Front Fog Lights" startbit="5" bitcount="1"></value> <!-- Передние ПТФ -->
+//       <value name="Indicator: Rear Fog Lights" startbit="6" bitcount="1"></value> <!-- Задний ПТФ -->
+//       <value name="Indicator: Parking Lights" startbit="7" bitcount="1"></value> <!-- Габариты -->
 
 //       <!-- Лампы по МИНУСУ  -->
 //       <value name="Indicator: Oil Pressure" startbit="8" bitcount="1"></value> <!-- Давление масла -->
