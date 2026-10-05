@@ -76,12 +76,12 @@ SystemState currentState = STATE_PRE_DRIVE_WAKE; //
 // ==========================================================================
 // --- ПЕРЕМЕННЫЕ И ТАЙМИНГИ ---
 // ==========================================================================
-const unsigned long TIMEOUT_WAIT_IGNITION = 18000; // Время ожидания зажигания
+const unsigned long TIMEOUT_WAIT_IGNITION = 10000; // Время ожидания зажигания
 const unsigned long WAKE_FILTER_DELAY     = 1000;   // Фильтр сигнала ЦЗ
 const float CRITICAL_BATTERY_VOLTAGE      = 11.7;    // Порог защиты аккумулятора от разряда (Вольты)
 const unsigned long DEBOUNCE_DELAY = 250;     // Игнорируем помехи короче 250 мс
 volatile int clickCount = 0;        // Переменная счетчика нажатий ЦЗ (volatile обязателен для прерываний)
-volatile unsigned long lastDebounceTime = 0; 
+// volatile unsigned long lastDebounceTime = 0; 
 volatile bool wakeUpIgnition = false;       // Флаг того, что проснулись от зажигания
 volatile unsigned long sleepSecondsCount = 0;
 
@@ -94,8 +94,8 @@ unsigned long timerFastSensors = 0;
 unsigned long timerNormSensors = 0;
 unsigned long timerSlowSensors = 0;
 
-const unsigned long INTERVAL_FAST = 500;  
-const unsigned long INTERVAL_NORM = 1000; 
+const unsigned long INTERVAL_FAST = 1000;  
+const unsigned long INTERVAL_NORM = 1500; 
 const unsigned long INTERVAL_SLOW = 2000; 
 
 // Коэффициенты под Nissan Almera G15
@@ -142,12 +142,16 @@ uint8_t readBatteryVoltageX10(int counter) {
 }
 // --- ФУНКЦИИ ОБРАБОТКИ ПРЕРЫВАНИЙ ---
 // Обработчик прерывания (должен быть максимально коротким!)
-void doorTriggerInterrupt() {
-  unsigned long currentTime = millis();
-  // Защита от дребезга контактов и наводок
-  if (currentTime - lastDebounceTime > DEBOUNCE_DELAY) {
+void doorTriggerISRSleep() {
+  clickCount = 1; // Нас разбудил первый клик. Фиксируем его.
+}
+void doorTriggerISRWork() {
+  unsigned long currentTime = micros(); // В ISR надежнее использовать micros(), он точнее для дребезга
+  static unsigned long lastWorkDebounceTime = 0;
+  
+  if (currentTime - lastWorkDebounceTime > (DEBOUNCE_DELAY * 1000)) {
     clickCount++;
-    lastDebounceTime = currentTime;
+    lastWorkDebounceTime = currentTime;
   }
 }
 void wakeUpISR() {
@@ -164,20 +168,7 @@ void rpmPulseCounter() {
 void speedPulseCounter() {
   speedPulses++;
 }
-// Настройка Watchdog на режим прерываний (Interrupt Mode) на 1 секунду
-// void setup_WDT(uint8_t timeout) {
-//   cli(); // Запрещаем прерывания на время настройки
-//   wdt_reset();
-//   // Разрешаем изменение битов конфигурации WDT
-//   // MCUSR &= ~(1 << WDRF);
-//   WDTCSR |= (1 << WDCE) | (1 << WDE);
-//   // Настраиваем таймер на 1 секунду + включаем режим прерываний (а не перезагрузки!)
-//   // Для 1 секунды: WDP2=1, WDP1=1, WDP0=0. WDIE=1 (прерывание)
-//   // WDTCSR = (1 << WDIE) | (1 << WDP2) | (1 << WDP1);
-//   WDTCSR = (1 << WDIE) | (timeout & 0x07);
-//   if (timeout > 7) WDTCSR |= (1 << WDP3);
-//   sei(); // Разрешаем прерывания обратно
-// }
+
 void setup() {
   // Установка стартового времени вручную (Часы, Минуты, Секунды, День, Месяц, Год)
   // В будущем Tanix сможет обновить это время через UART при старте
@@ -373,27 +364,44 @@ void loop() {
       clickCount = 0;
       // Настраиваем прерывания
       attachInterrupt(digitalPinToInterrupt(PIN_IGNITION), wakeUpISR, LOW);
-      attachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER), doorTriggerInterrupt, LOW);
+      attachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER), doorTriggerISRSleep, LOW);
+
       byte old_ADCSRA = ADCSRA; // Сохраняем настройки АЦП
       ADCSRA &= ~(1 << ADEN); // Отключаем АЦП
+      // Выключаем аппаратные таймеры
+      power_timer0_disable(); power_timer1_disable(); power_timer2_disable();
+      power_timer3_disable(); power_timer4_disable(); power_timer5_disable();
+      // Отключаем все интерфейсы связи: I2C (FRAM засыпает) и SPI
+      power_twi_disable(); power_spi_disable();
+      // Выключаем последовательные порты (включая Serial, Serial1, Serial2, Serial3)
+      power_usart0_disable(); power_usart1_disable(); power_usart3_disable();
+      // power_usart2_disable(); 
 
+      
       // ЦИКЛ ГЛУБОКОГО СНА 
       while (!wakeUpIgnition && clickCount == 0) {
-        
-        wdt_enable(WDTO_1S); //Задаем интервал сторожевого таймера
-        WDTCSR |= (1 << WDIE); //Устанавливаем бит WDIE регистра WDTCSR для разрешения прерываний от сторожевого таймера
+
+        // wdt_enable(WDTO_1S); //Задаем интервал сторожевого таймера
+        // WDTCSR |= (1 << WDIE); //Устанавливаем бит WDIE регистра WDTCSR для разрешения прерываний от сторожевого таймера
+
+        cli(); 
+        wdt_reset();
+        WDTCSR |= (1 << WDCE) | (1 << WDE);
+        WDTCSR = (1 << WDIE) | (1 << WDP2) | (1 << WDP1); 
+        sei(); 
+
         set_sleep_mode(SLEEP_MODE_PWR_DOWN);
 
-        // sleep_enable();
+        sleep_enable();
         // Отключаем детектор просадки напряжения (BOD) ради экономии (опционально)
         // Работает на оригинальных AVR, экономит около 20-25 мкА
         // #if defined(MCUCR) && defined(BODS) && defined(BODSE)
           // MCUCR |= (1 << BODS) | (1 << BODSE);
           // MCUCR = (MCUCR & ~(1 << BODSE)) | (1 << BODS);
         // #endif
-        // sleep_cpu(); // Засыпаем...
+        sleep_cpu(); // Засыпаем...
 
-        sleep_mode();
+        // sleep_mode();
         
         // --- ПРОСНУЛИСЬ (от первого клика брелка, зажигания или Watchdog) ---
         wdt_disable();
@@ -402,21 +410,14 @@ void loop() {
       // sleep_disable();
       // ADCSRA |= (1 << ADEN); // Включаем АЦП обратно
       ADCSRA = old_ADCSRA;     // Включаем АЦП обратно (восстанавливаем настройки)
-      // Перенастраиваем прерывание на FALLING (спад сигнала). 
-      // Когда МК уже бодрствует, FALLING работает идеально и точнее считает импульсы.
+      power_timer0_enable(); delayMicroseconds(10); // для millis()
+      
       detachInterrupt(digitalPinToInterrupt(PIN_IGNITION));
       detachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER));
-      attachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER), doorTriggerInterrupt, FALLING);
-      // Корректируем время в TimeLib на то количество секунд, что мы спали
-      adjustTime(sleepSecondsCount);
-      // Serial2.println(F("Просыпаемся от зажигания или нажатия ЦЗ на брелке..."));
       
-      if (wakeUpIgnition) {
-        wakeUpIgnition = false;
-        currentState = STATE_DRIVE;
-        Serial2.println(F("Появилось зажигание. Состояние изменено на DRIVE. Наслаждайтесь поездкой"));
-      }
       if (clickCount > 0) {
+        // Перенастраиваем прерывание на FALLING (спад сигнала) с другой функцией. 
+        attachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER), doorTriggerISRWork, FALLING);
         unsigned long windowTimer = millis();
         int currentClicks = clickCount;
     
@@ -427,6 +428,13 @@ void loop() {
             windowTimer = millis(); 
           }
         }
+
+        detachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER));
+
+        // РАСПРЕДЕЛЕНИЕ ЛОГИКИ ПО КОЛИЧЕСТВУ КЛИКОВ:
+        Serial2.print("Всего зафиксировано кликов: ");
+        Serial2.println(currentClicks);
+
         if (currentClicks == 1) {
           // 1 КЛИК = Точно едем! Проверяем АКБ перед запуском приставки
           float batteryVoltage = readBatteryVoltageX10(3) * 0.1;
@@ -435,10 +443,27 @@ void loop() {
               digitalWrite(PIN_ACC_OUTPUT, HIGH); // ВКЛЮЧАЕМ BTS442
               currentState = STATE_PRE_DRIVE_WAKE;
               wakeUpTimerStart = millis();
-          } else { 
-            Serial2.println(F("Батарея разряжена..."));  
-          }
-        }   
+          } 
+          else Serial2.println(F("Батарея разряжена..."));
+        } 
+        else {
+          Serial2.println(F("Кликов больше одного. Идем спать..."));
+          return;
+        } 
+      }
+      // Корректируем время в TimeLib на то количество секунд, что мы спали
+      adjustTime(sleepSecondsCount);
+      // Включаем периферию обратно
+      power_timer1_enable(); power_timer2_enable();
+      power_timer3_enable(); power_timer4_enable(); power_timer5_enable();
+      power_twi_enable(); power_spi_enable();
+      power_usart0_enable(); power_usart1_enable(); power_usart3_enable();
+      // power_usart2_enable(); 
+
+      if (wakeUpIgnition) {
+        wakeUpIgnition = false;
+        currentState = STATE_DRIVE;
+        Serial2.println(F("Появилось зажигание. Состояние изменено на DRIVE. Наслаждайтесь поездкой"));
       }
       
       // Если проснулись от ключа зажигания, минуя ЦЗ (например, сидели внутри машины)
@@ -447,7 +472,6 @@ void loop() {
       //   
       // }
       // detachInterrupt(digitalPinToInterrupt(PIN_IGNITION));
-      detachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER));
     break;
   }
 }
