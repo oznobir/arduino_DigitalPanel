@@ -52,13 +52,13 @@ const InputChannel indicators[INDICATORS_COUNT] = {
   {27, "[Передние ПТФ] "},
   {29, "[Задний ПТФ] "},
   {31, "[Габариты] "},
-  {32, "[Давление масла] "}, 
-  {34, "[Ручник] "}, 
-  {36, "[Check Engine] "}, 
-  {38, "[Аккумулятор] "}, 
-  {40, "[ABS] "},
-  {42, "[Перегрев ОЖ] "},
-  {44, "[Ремень безопасности] "},
+  {6, "[Давление масла] "}, 
+  {8, "[Ручник] "}, 
+  {22, "[Check Engine] "}, 
+  {24, "[Аккумулятор] "}, 
+  {26, "[ABS] "},
+  {28, "[Перегрев ОЖ] "},
+  {30, "[Ремень безопасности] "},
   {33, "[Двери открыты] "},
   {35, "[Подушки безопасности] "}, 
   {37, "[Иммобилайзер] "}, 
@@ -99,6 +99,13 @@ unsigned long timerSlowSensors = 0;
 const unsigned long INTERVAL_FAST = 1000;  
 const unsigned long INTERVAL_NORM = 1500; 
 const unsigned long INTERVAL_SLOW = 2000; 
+
+// Переменные для неблокирующего ШИМ-старта
+// bool isStarting = false;     // Флаг того, что идет процесс запуска
+// int pwmDuty = 0;
+// unsigned long lastPwmMillis = 0;
+// const int pwmInterval = 4; // Шаг каждые 4 мс
+byte old_ADCSRA;
 
 // Коэффициенты под Nissan Almera G15
 const int pulsesPerTurnRPM = 2;        
@@ -166,6 +173,64 @@ uint8_t readBatteryVoltageX10(int counter) {
   float vPin = ((averageRaw * 5.0) / 1023.0) * dividerRatio;
   return vPin * 10; 
 }
+// Функция плавного пуска Андроид по ШИМ
+void handleSmoothStart() {
+  // Плавный пуск для обхода защиты BTS442E2 по току КЗ
+  for (int duty = 0; duty <= 255; duty += 3) { // ~85 шагов
+    analogWrite(PIN_ACC_OUTPUT, duty);
+    delay(4); // 85 * 4 мс = ~340 мс плавного заполнения емкостей конденсаторов XL4016
+  }
+  
+  // Жестко фиксируем пин в HIGH, переводя BTS442E2 в режим постоянного проводника
+  digitalWrite(PIN_ACC_OUTPUT, HIGH); 
+
+  // 2 вариант без delay(4);
+  
+  // if (millis() - lastPwmMillis >= pwmInterval) {
+  //   lastPwmMillis = millis();
+        
+  //   pwmDuty += 3; // Наращиваем ШИМ
+        
+  //   if (pwmDuty >= 255) {
+  //     digitalWrite(PIN_ACC_OUTPUT, HIGH); // Жестко фиксируем ключ в открытом состоянии 
+  //   } else {
+  //     analogWrite(PIN_ACC_OUTPUT, pwmDuty); // Плавная накачка емкостей
+  //   }
+  // }
+}
+
+// Функция, которая просто взводит флаг старта
+// void triggerSystemStart() {
+//   isStarting = true;
+//   currentDuty = 0;
+//   lastPwmTime = millis();
+// }
+
+// Фукция отключения модулей Ардуино
+void powerDisable() {
+  old_ADCSRA = ADCSRA; // Сохраняем настройки АЦП
+  ADCSRA &= ~(1 << ADEN); // Отключаем АЦП
+  // Выключаем аппаратные таймеры
+  power_timer0_disable(); power_timer1_disable(); power_timer2_disable();
+  power_timer3_disable(); power_timer4_disable(); power_timer5_disable();
+  // Отключаем все интерфейсы связи: I2C (FRAM засыпает) и SPI
+  power_twi_disable(); power_spi_disable();
+  // Выключаем последовательные порты (включая Serial, Serial1, Serial2, Serial3)
+  power_usart0_disable(); power_usart1_disable(); power_usart3_disable();
+  // power_usart2_disable(); 
+}
+// Фукция включения модулей Ардуино
+void powerEnable() {
+  ADCSRA = old_ADCSRA;     // Включаем АЦП обратно (восстанавливаем настройки)
+  power_timer0_enable(); delayMicroseconds(10); // для millis()
+      // Включаем периферию обратно
+  power_timer1_enable(); power_timer2_enable();
+  power_timer3_enable(); power_timer4_enable(); power_timer5_enable();
+
+  power_twi_enable(); power_spi_enable();
+  power_usart0_enable(); power_usart1_enable(); power_usart3_enable();
+  // power_usart2_enable(); 
+}
 // --- ФУНКЦИИ ОБРАБОТКИ ПРЕРЫВАНИЙ ---
 // Обработчик прерывания (должен быть максимально коротким!)
 void doorTriggerISRSleep() {
@@ -193,6 +258,118 @@ void rpmPulseCounter() {
 
 void speedPulseCounter() {
   speedPulses++;
+}
+ // =========================================================================
+  //ФУНКЦИЯ ПОЛУЧЕНИЯ И ОТПРАВКИ БИНАРНЫХ ДАННЫХ ПО ТАЙМЕРАМ
+  // =========================================================================
+void receiveAndSendDataByTimers() {
+  unsigned long currentMillis = millis();
+  // 1. БЫСТРЫЕ ДАТЧИКИ
+  if (currentMillis - timerFastSensors >= INTERVAL_FAST) {
+    // Вычисляем точное время, прошедшее с момента последнего расчета
+    unsigned long timeElapsed = currentMillis - timerFastSensors;
+    timerFastSensors = currentMillis;    
+      
+    // Блокируем прерывания на доли микросекунды, чтобы безопасно скопировать данные
+    noInterrupts();
+    unsigned long localRpmPulses = rpmPulses;
+    unsigned long localSpeedPulses = speedPulses;
+    rpmPulses = 0;     // Сбрасываем счетчик импульсов тахометра
+    speedPulses = 0;   // Сбрасываем счетчик импульсов скорости
+    interrupts();      // Снова разрешаем прерывания
+
+    // Расчет физических величин
+    float calcRPM = ((float)localRpmPulses / pulsesPerTurnRPM) * (60000.0 / timeElapsed);
+    currentRPM = (calcRPM < 0) ? 0 : (int)calcRPM;
+
+    float calcSpeed = ((float)localSpeedPulses / pulsesPerKmSpeed) / ((float)timeElapsed / 3600000.0);
+    currentSpeed = (calcSpeed < 1.0) ? 0 : (int)calcSpeed;
+    
+    // Вывод быстрых данных в Монитор порта
+    TEST_SERIAL.print(F(" ")); TEST_SERIAL.print(hour()); TEST_SERIAL.print(":"); 
+    TEST_SERIAL.print(minute()); TEST_SERIAL.print(":"); TEST_SERIAL.println(second());
+    TEST_SERIAL.print(F(" RPM: ")); TEST_SERIAL.print(currentRPM);
+    TEST_SERIAL.print(F(" | SPD: ")); TEST_SERIAL.print(currentSpeed, 1); TEST_SERIAL.println(F(" km/h"));
+            
+    byteIndicators = 0;
+    bool hasActiveLamps = false;
+
+    for (int i = 0; i < INDICATORS_COUNT; i++) {
+      if (digitalRead(indicators[i].pin) == LOW) {
+        byteIndicators |= (1UL << i);
+        
+        if (!hasActiveLamps) {
+          TEST_SERIAL.print(F(" LAMPS: "));
+          hasActiveLamps = true;
+        }
+        TEST_SERIAL.print(indicators[i].name); 
+      }
+    }
+    if (hasActiveLamps) TEST_SERIAL.println(); // Перенос строки в конце списка
+      
+    if (digitalRead(PIN_IGNITION) == LOW)     TEST_SERIAL.println(F(" [ Зажигание ]")); 
+      
+    // --- Подготовка пакета данных для Кадра 101 ---
+    uint8_t data3200[8] = {0};
+    memcpy(data3200, &byteIndicators, 4);
+    memcpy(data3200 + 4, &currentRPM, 2);
+    memcpy(data3200 + 6, &currentSpeed, 2);
+      
+    // Отправка в RealDash
+    sendRealDashFrame(3200, data3200);
+  }
+
+  // 2. СТАНДАРТНЫЕ ДАТЧИКИ 
+  if (currentMillis - timerNormSensors >= INTERVAL_NORM) {
+    timerNormSensors = currentMillis;
+  }
+
+  // 3. МЕДЛЕННЫЕ ДАТЧИКИ
+  if (currentMillis - timerSlowSensors >= INTERVAL_SLOW) {
+    timerSlowSensors = currentMillis;
+      
+    // Чтение вольтметра
+    voltPackedX10 = readBatteryVoltageX10(10); 
+    float batteryVoltage = voltPackedX10 * 0.1; 
+    // Чтение сырого АЦП ДТОЖ (с защитой мультиплексора)
+    analogRead(PIN_ECT); 
+    int rawSumTemp = 0;
+    for(int i = 0; i < 10; i++) rawSumTemp += analogRead(PIN_ECT);
+    rawECT = rawSumTemp / 10;
+
+    // Чтение сырого АЦП ДУТ (с защитой мультиплексора)
+    analogRead(PIN_FUEL); 
+    int rawSumFuel = 0;
+    for(int i = 0; i < 10; i++) rawSumFuel += analogRead(PIN_FUEL);
+    rawFuel = rawSumFuel / 10;
+
+    sensors.requestTemperatures(); // Запрос у всех датчиков
+
+    // Чтение строго по ID адресам
+    currentInterP40 = sensors.getTempC(interTempSensor) + 40;
+    currentOuterP40 = sensors.getTempC(outerTempSensor) + 40;
+            
+    uint8_t data3201[8] = {0};
+    memcpy(data3201, &rawECT, 2);
+    memcpy(data3201 + 2, &rawFuel, 2);
+    memcpy(data3201 + 4, &voltPackedX10, 1);
+    memcpy(data3201 + 5, &currentInterP40, 1);
+    memcpy(data3201 + 6, &currentOuterP40, 1);
+      
+    // Отправка в RealDash
+    sendRealDashFrame(3201, data3201);
+      
+    //Вывод медленных данных в Монитор порта
+    TEST_SERIAL.println(F("----------------------------------"));
+    TEST_SERIAL.print(F(" "));TEST_SERIAL.print(hour()); TEST_SERIAL.print(":"); 
+    TEST_SERIAL.print(minute()); TEST_SERIAL.print(":"); TEST_SERIAL.println(second());
+    TEST_SERIAL.print(F(" VOLTAGE: ")); TEST_SERIAL.print(batteryVoltage, 2); TEST_SERIAL.print(F(" V"));
+    TEST_SERIAL.print(F(" | ДТОЖ ADC: ")); TEST_SERIAL.print(rawECT); 
+    TEST_SERIAL.print(F(" | ДУТ ADC: ")); TEST_SERIAL.println(rawFuel);
+    TEST_SERIAL.print(F(" | Салон: ")); TEST_SERIAL.print((currentInterP40 - 40), 1); TEST_SERIAL.println(F(" °C"));
+    TEST_SERIAL.print(F(" | Улица: ")); TEST_SERIAL.print((currentOuterP40 - 40), 1); TEST_SERIAL.println(F(" °C"));
+    TEST_SERIAL.println(F("-----------------------------------"));
+  }  
 }
 
 void setup() {
@@ -229,134 +406,11 @@ void setup() {
   sensors.begin();
   delay(100);
   TEST_SERIAL.println(F("============ ЗАГРУЗКА СИСТЕМЫ ================"));
-  sendRealDashText(3210, "ЗАГРУЗКА");
-
+  
   if (digitalRead(PIN_IGNITION) == LOW) currentState = STATE_DRIVE;
 }
 
 void loop() {
-  // =========================================================================
-  // БЛОК ОТПРАВКИ БИНАРНЫХ ДАННЫХ ПО ТАЙМЕРАМ
-  // =========================================================================
-  if (currentState == STATE_PRE_DRIVE_WAKE || currentState == STATE_DRIVE) {
-    unsigned long currentMillis = millis();
-    // 1. БЫСТРЫЕ ДАТЧИКИ
-    if (currentMillis - timerFastSensors >= INTERVAL_FAST) {
-      // Вычисляем точное время, прошедшее с момента последнего расчета
-      unsigned long timeElapsed = currentMillis - timerFastSensors;
-      timerFastSensors = currentMillis;    
-      
-      // Блокируем прерывания на доли микросекунды, чтобы безопасно скопировать данные
-      noInterrupts();
-      unsigned long localRpmPulses = rpmPulses;
-      unsigned long localSpeedPulses = speedPulses;
-      rpmPulses = 0;     // Сбрасываем счетчик импульсов тахометра
-      speedPulses = 0;   // Сбрасываем счетчик импульсов скорости
-      interrupts();      // Снова разрешаем прерывания
-
-      // Расчет физических величин
-      float calcRPM = ((float)localRpmPulses / pulsesPerTurnRPM) * (60000.0 / timeElapsed);
-      currentRPM = (calcRPM < 0) ? 0 : (int)calcRPM;
-
-      float calcSpeed = ((float)localSpeedPulses / pulsesPerKmSpeed) / ((float)timeElapsed / 3600000.0);
-      currentSpeed = (calcSpeed < 1.0) ? 0 : (int)calcSpeed;
-    
-      // Вывод быстрых данных в Монитор порта
-      TEST_SERIAL.print(hour()); TEST_SERIAL.print(":"); 
-      TEST_SERIAL.print(minute()); TEST_SERIAL.print(":");
-      TEST_SERIAL.println(second());
-      TEST_SERIAL.print(F(" RPM: ")); TEST_SERIAL.print(currentRPM);
-      TEST_SERIAL.print(F(" | SPD: ")); TEST_SERIAL.print(currentSpeed, 1); TEST_SERIAL.println(F(" km/h"));
-            
-      byteIndicators = 0;
-      bool hasActiveLamps = false;
-      
-      // char textLampsBuffer[64]; // Буфер с запасом под имена всех возможных одновременно включенных ламп
-      // textLampsBuffer[0] = '\0'; // Очищаем буфер (делаем строку пустой)
-
-      for (int i = 0; i < INDICATORS_COUNT; i++) {
-        if (digitalRead(indicators[i].pin) == LOW) {
-          byteIndicators |= (1UL << i);
-          // strncat(textLampsBuffer, indicators[i].name, sizeof(textLampsBuffer) - strlen(textLampsBuffer) - 1);
-  
-          // Если это первый найденный индикатор, можно вывести заголовок
-          if (!hasActiveLamps) {
-            TEST_SERIAL.print(F(" LAMPS: "));
-            hasActiveLamps = true;
-          }
-          TEST_SERIAL.print(indicators[i].name); 
-        }
-      }
-      if (hasActiveLamps) TEST_SERIAL.println(); // Перенос строки в конце списка
-      
-
-      // TEST_SERIAL.print(F(" LAMPS: ")); TEST_SERIAL.println(textLampsBuffer);
-      if (digitalRead(PIN_IGNITION) == LOW)     TEST_SERIAL.println(F(" [ Зажигание ]")); 
-      
-      // --- Подготовка пакета данных для Кадра 101 ---
-      uint8_t data3200[8] = {0};
-      memcpy(data3200, &byteIndicators, 4);
-      memcpy(data3200 + 4, &currentRPM, 2);
-      memcpy(data3200 + 6, &currentSpeed, 2);
-      
-      // Отправка в RealDash
-      sendRealDashFrame(3200, data3200);
-      // sendRealDashText(3210, textLampsBuffer);
-    }
-
-    // 2. СТАНДАРТНЫЕ ДАТЧИКИ 
-    if (currentMillis - timerNormSensors >= INTERVAL_NORM) {
-      timerNormSensors = currentMillis;
-    }
-
-    // 3. МЕДЛЕННЫЕ ДАТЧИКИ
-    if (currentMillis - timerSlowSensors >= INTERVAL_SLOW) {
-      timerSlowSensors = currentMillis;
-      
-      // Чтение вольтметра
-      voltPackedX10 = readBatteryVoltageX10(10); 
-      float batteryVoltage = voltPackedX10 * 0.1; 
-      // Чтение сырого АЦП ДТОЖ (с защитой мультиплексора)
-      analogRead(PIN_ECT); 
-      int rawSumTemp = 0;
-      for(int i = 0; i < 10; i++) rawSumTemp += analogRead(PIN_ECT);
-      rawECT = rawSumTemp / 10;
-
-      // Чтение сырого АЦП ДУТ (с защитой мультиплексора)
-      analogRead(PIN_FUEL); 
-      int rawSumFuel = 0;
-      for(int i = 0; i < 10; i++) rawSumFuel += analogRead(PIN_FUEL);
-      rawFuel = rawSumFuel / 10;
-
-      sensors.requestTemperatures(); // Запрос у всех датчиков
-
-      // Чтение строго по ID адресам
-      currentInterP40 = sensors.getTempC(interTempSensor) + 40;
-      currentOuterP40 = sensors.getTempC(outerTempSensor) + 40;
-            
-      uint8_t data3201[8] = {0};
-      memcpy(data3201, &rawECT, 2);
-      memcpy(data3201 + 2, &rawFuel, 2);
-      memcpy(data3201 + 4, &voltPackedX10, 1);
-      memcpy(data3201 + 5, &currentInterP40, 1);
-      memcpy(data3201 + 6, &currentOuterP40, 1);
-      
-      // Отправка в RealDash
-      sendRealDashFrame(3201, data3201);
-      
-      //Вывод медленных данных в Монитор порта
-      TEST_SERIAL.println(F("----------------------------------"));
-      TEST_SERIAL.print(hour()); TEST_SERIAL.print(":"); 
-      TEST_SERIAL.print(minute()); TEST_SERIAL.print(":"); 
-      TEST_SERIAL.println(second());
-      TEST_SERIAL.print(F(" VOLTAGE: ")); TEST_SERIAL.print(batteryVoltage, 2); TEST_SERIAL.print(F(" V"));
-      TEST_SERIAL.print(F(" | ДТОЖ ADC: ")); TEST_SERIAL.print(rawECT); 
-      TEST_SERIAL.print(F(" | ДУТ ADC: ")); TEST_SERIAL.println(rawFuel);
-      TEST_SERIAL.print(F(" | Салон: ")); TEST_SERIAL.print((currentInterP40 - 40), 1); TEST_SERIAL.println(F(" °C"));
-      TEST_SERIAL.print(F(" | Улица: ")); TEST_SERIAL.print((currentOuterP40 - 40), 1); TEST_SERIAL.println(F(" °C"));
-      TEST_SERIAL.println(F("-----------------------------------"));
-    }
-  }
   // =========================================================================
   // АВТОМАТ СОСТОЯНИЙ ПИТАНИЯ
   // =========================================================================
@@ -367,44 +421,47 @@ void loop() {
   switch (currentState) {
     
     case STATE_PRE_DRIVE_WAKE:
-      if (digitalRead(PIN_ACC_OUTPUT) == LOW) digitalWrite(PIN_ACC_OUTPUT, HIGH);
-    
+
+      if (digitalRead(PIN_ACC_OUTPUT) == LOW) handleSmoothStart();
+
+      receiveAndSendDataByTimers();
+
       // Ждем зажигания в течение минут
       if (isIgnitionOn) {
         currentState = STATE_DRIVE;
-       TEST_SERIAL.println(F("Состояние изменено на DRIVE. Наслаждайтесь поездкой"));
-       sendRealDashText(3210, "DRIVE. Зажигание включено");
+        TEST_SERIAL.println(F("Состояние изменено на DRIVE. Наслаждайтесь поездкой"));
       } 
       else if (millis() - wakeUpTimerStart >= TIMEOUT_WAIT_IGNITION) {
         currentState = STATE_SHUTDOWN;
         TEST_SERIAL.println(F("Состояние изменено на SHUTDOWN. Вышло время"));
-        sendRealDashText(3210, "SHUTDOWN. Вышло время");
       }
       
       break;
 
     case STATE_DRIVE:
-      if (digitalRead(PIN_ACC_OUTPUT) == LOW) digitalWrite(PIN_ACC_OUTPUT, HIGH);
-      // wdt_disable();
+
+      if (digitalRead(PIN_ACC_OUTPUT) == LOW) handleSmoothStart();
+
+      receiveAndSendDataByTimers();
+
       // В режиме поездки нам плевать на любые клацанья ЦЗ или дверей. Мы смотрим только на зажигание.
       if (!isIgnitionOn) {
         currentState = STATE_SHUTDOWN;
         TEST_SERIAL.println(F("Состояние изменено на SHUTDOWN. Машина выключена"));
-        sendRealDashText(3210, "SHUTDOWN. Зажигание выключено");
       }
       break;
 
     case STATE_SHUTDOWN:
+
       TEST_SERIAL.println(F("Состояние изменено на SLEEP! Выключаем питание Андроид..."));
-      sendRealDashText(3210, "SLEEP. Андроид выключен");
       digitalWrite(PIN_ACC_OUTPUT, LOW); // Обесточиваем магнитолу через BTS442
       delay(500); // Короткая пауза для записи кэша магнитолы
-     
       currentState = STATE_SLEEP;
       
       break;
 
     case STATE_SLEEP:
+
       // Сбрасываем счетчик секунд сна перед погружением
       sleepSecondsCount = 0;
       clickCount = 0;
@@ -412,23 +469,10 @@ void loop() {
       attachInterrupt(digitalPinToInterrupt(PIN_IGNITION), wakeUpISR, LOW);
       attachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER), doorTriggerISRSleep, LOW);
 
-      byte old_ADCSRA = ADCSRA; // Сохраняем настройки АЦП
-      ADCSRA &= ~(1 << ADEN); // Отключаем АЦП
-      // Выключаем аппаратные таймеры
-      power_timer0_disable(); power_timer1_disable(); power_timer2_disable();
-      power_timer3_disable(); power_timer4_disable(); power_timer5_disable();
-      // Отключаем все интерфейсы связи: I2C (FRAM засыпает) и SPI
-      power_twi_disable(); power_spi_disable();
-      // Выключаем последовательные порты (включая Serial, Serial1, Serial2, Serial3)
-      power_usart0_disable(); power_usart1_disable(); power_usart3_disable();
-      // power_usart2_disable(); 
+      powerDisable();
 
-      
       // ЦИКЛ ГЛУБОКОГО СНА 
       while (!wakeUpIgnition && clickCount == 0) {
-
-        // wdt_enable(WDTO_1S); //Задаем интервал сторожевого таймера
-        // WDTCSR |= (1 << WDIE); //Устанавливаем бит WDIE регистра WDTCSR для разрешения прерываний от сторожевого таймера
 
         cli(); 
         wdt_reset();
@@ -437,39 +481,21 @@ void loop() {
         sei(); 
 
         set_sleep_mode(SLEEP_MODE_PWR_DOWN);
-
         sleep_enable();
-        // Отключаем детектор просадки напряжения (BOD) ради экономии (опционально)
-        // Работает на оригинальных AVR, экономит около 20-25 мкА
-        // #if defined(MCUCR) && defined(BODS) && defined(BODSE)
-          // MCUCR |= (1 << BODS) | (1 << BODSE);
-          // MCUCR = (MCUCR & ~(1 << BODSE)) | (1 << BODS);
-        // #endif
         sleep_cpu(); // Засыпаем...
 
-        // sleep_mode();
-        
         // --- ПРОСНУЛИСЬ (от первого клика брелка, зажигания или Watchdog) ---
         wdt_disable();
         sleep_disable();
       }
-      // sleep_disable();
-      // ADCSRA |= (1 << ADEN); // Включаем АЦП обратно
-      ADCSRA = old_ADCSRA;     // Включаем АЦП обратно (восстанавливаем настройки)
-      power_timer0_enable(); delayMicroseconds(10); // для millis()
-      
+
+      powerEnable();
+  
       detachInterrupt(digitalPinToInterrupt(PIN_IGNITION));
       detachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER));
       
       // Корректируем время в TimeLib на то количество секунд, что мы спали
       adjustTime(sleepSecondsCount);
-      // Включаем периферию обратно
-      power_timer1_enable(); power_timer2_enable();
-      power_timer3_enable(); power_timer4_enable(); power_timer5_enable();
-      power_twi_enable(); power_spi_enable();
-      power_usart0_enable(); power_usart1_enable(); power_usart3_enable();
-      // power_usart2_enable(); 
-
       
       if (clickCount > 0) {
         // Перенастраиваем прерывание на FALLING (спад сигнала) с другой функцией. 
@@ -484,40 +510,26 @@ void loop() {
             windowTimer = millis(); 
           }
         }
-
         detachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER));
 
         // РАСПРЕДЕЛЕНИЕ ЛОГИКИ ПО КОЛИЧЕСТВУ КЛИКОВ:
         TEST_SERIAL.print(F("Всего зафиксировано кликов: ")); TEST_SERIAL.println(currentClicks);
-        sendRealDashText(3210, (String("Клики: ") + currentClicks).c_str());
-        // char textBufferClicks[32];    // Буфер для итоговой строки
-        // snprintf_P(textBufferClicks, sizeof(textBufferClicks), PSTR("Клики: %d"), currentClicks);
-        // sendRealDashText(3210, textBufferClicks);
-
+       
         if (currentClicks == 1) {
           // 1 КЛИК = Точно едем! Проверяем АКБ перед запуском приставки
           float batteryVoltage = readBatteryVoltageX10(3) * 0.1;
           
           if (batteryVoltage > CRITICAL_BATTERY_VOLTAGE) {
-              digitalWrite(PIN_ACC_OUTPUT, HIGH); // ВКЛЮЧАЕМ BTS442
+              handleSmoothStart(); // ВКЛЮЧАЕМ BTS442
               currentState = STATE_PRE_DRIVE_WAKE;
               wakeUpTimerStart = millis();
           } 
           else {
             TEST_SERIAL.println(F("Батарея разряжена..."));
-            sendRealDashText(3210, (String("Батарея: ") + batteryVoltage + " v").c_str());
-            delay(500); // Короткая пауза
-            // char voltStr[8];
-            // char textBufferVoltage[32];
-            // dtostrf(batteryVoltage, 4, 2, voltStr);
-            // snprintf_P(textBufferVoltage, sizeof(textBufferVoltage), PSTR("Батарея: %s v"), voltStr);
-            // sendRealDashText(3210, textBufferVoltage); 
           }
         } 
         else {
           TEST_SERIAL.println(F("Кликов больше двух. Идем спать..."));
-          sendRealDashText(3210, "Идем спать ...");
-          delay(500); // Короткая пауза
           return;
         } 
       }
@@ -527,8 +539,7 @@ void loop() {
         // Если проснулись от ключа зажигания, минуя ЦЗ (например, сидели внутри машины)
         if (digitalRead(PIN_IGNITION) == LOW) { 
           currentState = STATE_DRIVE;
-          TEST_SERIAL.println(F("Появилось зажигание. Состояние изменено на DRIVE. Наслаждайтесь поездкой"));
-          sendRealDashText(3210, "DRIVE. Зажигание включено");
+          TEST_SERIAL.println(F("Появилось зажигание. Состояние изменено на DRIVE."));
         }
       }
     break;
