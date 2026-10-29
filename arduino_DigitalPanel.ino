@@ -1,12 +1,15 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <mcp_can.h>
-#include <OneWire.h>
-#include <DallasTemperature.h>
-#include <avr/sleep.h>
+#include <OneWire.h>             
+#include <DallasTemperature.h>   // Библиотека для работы с цифровыми датчиками
+#include <avr/sleep.h>           
 #include <avr/power.h>
-#include <avr/wdt.h>    // Библиотека сторожевого таймера
-#include <TimeLib.h>    // Библиотека для работы со временем
+#include <avr/wdt.h>             // Библиотека сторожевого таймера
+#include <TimeLib.h>             // Библиотека для работы со временем
+#include <Wire.h>                // Библиотека для работы с I2C
+#include <RTClib.h>              // Библиотека для работы с RTC DS3231
+#include <Adafruit_FRAM_I2C.h>   // Библиотека для работы со fram-памятью MB85RC256V
 
 // =========================================================================
 // АВТОМОБИЛЬНЫЙ КОНТРОЛЛЕР ПИТАНИЯ И ДАТЧИКОВ (REALDASH CAN ВЕРСИЯ)
@@ -20,7 +23,8 @@ DallasTemperature sensors(&oneWire);
 // Прописываем уникальные ID адреса датчиков
 DeviceAddress interTempSensor = { 0x28, 0x79, 0xF4, 0xC8, 0x00, 0x00, 0x00, 0x8C };
 DeviceAddress outerTempSensor = { 0x28, 0xC5, 0xD7, 0xC9, 0x00, 0x00, 0x00, 0xCF };
-
+RTC_DS3231 rtc;
+Adafruit_FRAM_I2C fram = Adafruit_FRAM_I2C();
 // ==========================================================================
 // --- КОНФИГУРАЦИЯ ПИНОВ ---
 // ==========================================================================
@@ -74,7 +78,8 @@ enum SystemState {
   STATE_SHUTDOWN
 };
 
-SystemState currentState = STATE_PRE_DRIVE_WAKE; // 
+SystemState currentState = STATE_PRE_DRIVE_WAKE;
+
 // ==========================================================================
 // --- ПЕРЕМЕННЫЕ И ТАЙМИНГИ ---
 // ==========================================================================
@@ -100,11 +105,6 @@ const unsigned long INTERVAL_FAST = 1000;
 const unsigned long INTERVAL_NORM = 1500; 
 const unsigned long INTERVAL_SLOW = 2000; 
 
-// Переменные для неблокирующего ШИМ-старта
-// bool isStarting = false;     // Флаг того, что идет процесс запуска
-// int pwmDuty = 0;
-// unsigned long lastPwmMillis = 0;
-// const int pwmInterval = 4; // Шаг каждые 4 мс
 byte old_ADCSRA;
 
 // Коэффициенты под Nissan Almera G15
@@ -183,28 +183,7 @@ void handleSmoothStart() {
   
   // Жестко фиксируем пин в HIGH, переводя BTS442E2 в режим постоянного проводника
   digitalWrite(PIN_ACC_OUTPUT, HIGH); 
-
-  // 2 вариант без delay(4);
-  
-  // if (millis() - lastPwmMillis >= pwmInterval) {
-  //   lastPwmMillis = millis();
-        
-  //   pwmDuty += 3; // Наращиваем ШИМ
-        
-  //   if (pwmDuty >= 255) {
-  //     digitalWrite(PIN_ACC_OUTPUT, HIGH); // Жестко фиксируем ключ в открытом состоянии 
-  //   } else {
-  //     analogWrite(PIN_ACC_OUTPUT, pwmDuty); // Плавная накачка емкостей
-  //   }
-  // }
 }
-
-// Функция, которая просто взводит флаг старта
-// void triggerSystemStart() {
-//   isStarting = true;
-//   currentDuty = 0;
-//   lastPwmTime = millis();
-// }
 
 // Фукция отключения модулей Ардуино
 void powerDisable() {
@@ -286,8 +265,7 @@ void receiveAndSendDataByTimers() {
     currentSpeed = (calcSpeed < 1.0) ? 0 : (int)calcSpeed;
     
     // Вывод быстрых данных в Монитор порта
-    TEST_SERIAL.print(F(" ")); TEST_SERIAL.print(hour()); TEST_SERIAL.print(":"); 
-    TEST_SERIAL.print(minute()); TEST_SERIAL.print(":"); TEST_SERIAL.println(second());
+    sendRtsNowToSerial();
     TEST_SERIAL.print(F(" RPM: ")); TEST_SERIAL.print(currentRPM);
     TEST_SERIAL.print(F(" | SPD: ")); TEST_SERIAL.print(currentSpeed, 1); TEST_SERIAL.println(F(" km/h"));
             
@@ -361,8 +339,7 @@ void receiveAndSendDataByTimers() {
       
     //Вывод медленных данных в Монитор порта
     TEST_SERIAL.println(F("----------------------------------"));
-    TEST_SERIAL.print(F(" "));TEST_SERIAL.print(hour()); TEST_SERIAL.print(":"); 
-    TEST_SERIAL.print(minute()); TEST_SERIAL.print(":"); TEST_SERIAL.println(second());
+    sendRtsNowToSerial();
     TEST_SERIAL.print(F(" VOLTAGE: ")); TEST_SERIAL.print(batteryVoltage, 2); TEST_SERIAL.print(F(" V"));
     TEST_SERIAL.print(F(" | ДТОЖ ADC: ")); TEST_SERIAL.print(rawECT); 
     TEST_SERIAL.print(F(" | ДУТ ADC: ")); TEST_SERIAL.println(rawFuel);
@@ -371,18 +348,41 @@ void receiveAndSendDataByTimers() {
     TEST_SERIAL.println(F("-----------------------------------"));
   }  
 }
+// Тестовая функция проверки устройств, подключенных к I2C шине
+void testWriteReadFram() {
+// Тестовая запись во FRAM (адрес 0x0000, значение 42)
+  uint16_t testAddr = 0x0000;
+  uint8_t writeVal = 42;
+  fram.write(testAddr, writeVal);
+  
+  // Тестовое чтение из FRAM
+  uint8_t readVal = fram.read(testAddr);
+  TEST_SERIAL.print(F("Считано из FRAM: "));
+  TEST_SERIAL.println(readVal);
+}
+void sendRtsNowToSerial() {
+  // Получаем текущее время из RTC
+  DateTime now = rtc.now();
 
+  // Выводим время в консоль
+  TEST_SERIAL.print(now.year(), DEC);  TEST_SERIAL.print('/');
+  TEST_SERIAL.print(now.month(), DEC);  TEST_SERIAL.print('/');
+  TEST_SERIAL.print(now.day(), DEC);  TEST_SERIAL.print(" ");
+  TEST_SERIAL.print(now.hour(), DEC);  TEST_SERIAL.print(':');
+  TEST_SERIAL.print(now.minute(), DEC);  TEST_SERIAL.print(':');
+  TEST_SERIAL.print(now.second(), DEC);  TEST_SERIAL.println();
+}
 void setup() {
   // Установка стартового времени вручную (Часы, Минуты, Секунды, День, Месяц, Год)
   // В будущем Tanix сможет обновить это время через UART при старте
-  setTime(12, 0, 0, 5, 10, 2026);
-
-  // setup_WDT(WDTO_1S); // Настройка Watchdog
-
+  // setTime(12, 0, 0, 5, 10, 2026);
+  
   TEST_SERIAL.begin(9600);
   pinMode(17, INPUT_PULLUP); // Подтяжка RX линии TEST_SERIAL 
   delay(100);
-    
+
+  TEST_SERIAL.println(F("============ ЗАГРУЗКА СИСТЕМЫ ================"));
+  TEST_SERIAL.println(F("Инициализация устройств..."));
   // Инициализация остальных пинов
   pinMode(PIN_ACC_OUTPUT, OUTPUT); 
   digitalWrite(PIN_ACC_OUTPUT, LOW);
@@ -404,9 +404,30 @@ void setup() {
 
   RD_SERIAL.begin(115200);
   sensors.begin();
-  delay(100);
-  TEST_SERIAL.println(F("============ ЗАГРУЗКА СИСТЕМЫ ================"));
   
+  Wire.begin(); // Инициализация I2C шины для Mega (пины 20 и 21 инициализируются автоматически)
+
+  if (!rtc.begin()) {  // 1. Проверка RTC DS3231
+    TEST_SERIAL.println(F("Не удалось найти модуль RTC!"));
+    while (1) delay(10);
+  }
+
+  if (rtc.lostPower()) { // Если RTC потерял питание, устанавливаем время компиляции
+    TEST_SERIAL.println(F("RTC потерял питание, устанавливаем время..."));
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+
+  if (!fram.begin(0x50)) {  // 2. Проверка FRAM MB85RC256V. По умолчанию адрес чипа 0x50 (если выводы A0, A1, A2 замкнуты на GND)
+    TEST_SERIAL.println(F("Не удалось найти память FRAM!"));
+    while (1) delay(10);
+  }
+
+  testWriteReadFram();
+  sendRtsNowToSerial();
+
+  TEST_SERIAL.println(F("Все устройства успешно подключены!"));
+  delay(100);
+ 
   if (digitalRead(PIN_IGNITION) == LOW) currentState = STATE_DRIVE;
 }
 
