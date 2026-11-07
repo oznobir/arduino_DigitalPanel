@@ -627,7 +627,7 @@ void parseGboBuffer() {
 
   if (sumInjPetrolX10 > 0) {
     uint64_t numeratorPetrolX10 = (uint64_t)sumInjPetrolX10 * rpmGBO * deltaTimeGboMs;
-    sumInjPetrolMs = (numeratorPetrolX10 + 600000ULL) / 1200000ULL;
+    sumInjPetrolMs += (numeratorPetrolX10 + 600000ULL) / 1200000ULL;
     while (sumInjPetrolMs >= 1000) {
       activePetrol.totalInjSeconds++;
       sumInjPetrolMs -= 1000;
@@ -635,7 +635,7 @@ void parseGboBuffer() {
   }
   if (sumInjLpgX10 > 0) {
     uint64_t numeratorLpgX10 = (uint64_t)sumInjLpgX10 * rpmGBO * deltaTimeGboMs;
-    sumInjLpgMs = (numeratorLpgX10 + 600000ULL) / 1200000ULL;
+    sumInjLpgMs += (numeratorLpgX10 + 600000ULL) / 1200000ULL;
     while (sumInjLpgMs >= 1000) {
       activeLpg.totalInjSeconds++;
       sumInjLpgMs -= 1000;
