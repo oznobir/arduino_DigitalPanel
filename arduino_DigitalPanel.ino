@@ -116,7 +116,8 @@ struct HistoryRecord {
   uint32_t distanceMeters;
   uint32_t totalInjSeconds;
   uint32_t durationSeconds;
-  float initialFuelLiters;
+  uint16_t remainderFuelLitersX10;
+  uint16_t initialFuelLitersX10;
   uint8_t fuelType;  // 1 - Бензин, 2 - Газ
   uint8_t status;    // 0 - Активна, 1 - Закрыта, 2 - Повреждена (Битый CRC)
   uint8_t reserved;  // Выравнивание структуры до кратности 4 байтам
@@ -217,8 +218,8 @@ uint8_t tempInterP40 = 0;
 uint8_t tempOuterP40 = 0;
 uint32_t byteIndicators = 0;
 unsigned int rpmGBO = 0;
-uint16_t sumInjPetrolMs = 0;
-uint16_t sumInjLpgMs = 0;
+uint16_t remInjPetrolMs = 0;
+uint16_t remInjLpgMs = 0;
 
 
 
@@ -502,12 +503,12 @@ void collectNormData() {
   // Кадр 0x200 (Остатки)
   // float curLpgLiters = max(0.0f, activeLpg.initialFuelLiters - ((float)activeLpg.totalInjMs * LPG_LITERS_PER_MS));
   // float curPetrolLiters = max(0.0f, activePetrol.initialFuelLiters - ((float)activePetrol.totalInjMs * PETROL_LITERS_PER_MS));
-  uint32_t curLpgLitersX10 = max(0, activeLpg.initialFuelLiters - (tripLpgKm * 105 + 500) / 1000);
-  uint32_t curPetrolLitersX10 = max(0, activePetrol.initialFuelLiters - (tripPetrolKm * 125 + 500) / 1000);
+  uint16_t curLpgLitersX10 = max(0, activeLpg.remainderFuelLitersX10 + activeLpg.initialFuelLitersX10 - (tripLpgKm * 105 + 500) / 1000);           // 10,5 л на 100 км
+  uint16_t curPetrolLitersX10 = max(0, activeLpg.remainderFuelLitersX10 + activePetrol.initialFuelLitersX10 - (tripPetrolKm * 125 + 500) / 1000);  // 12,5 л на 100 км
 
   uint8_t data3207[8] = { 0 };
-  memcpy(data3207, &curLpgLitersX10, 4);
-  memcpy(data3207 + 4, &curLpgLitersX10, 4);
+  memcpy(data3207, &curLpgLitersX10, 2);
+  memcpy(data3207 + 2, &curLpgLitersX10, 2);
 
   // Отправка в RealDash
   sendRealDashFrame(3207, data3207);
@@ -566,6 +567,12 @@ void collectSlowData() {
   TEST_SERIAL.println(F("-----------------------------------"));
 }
 // =========================================================================
+// --- ФУНКЦИЯ ОТПРАВКИ ДАННЫХ ПО ПОЗДКАМ ПОСЛЕ СНА В REALDASH ---
+// =========================================================================
+void sendTripsDataAfterWakeUp() {
+
+}
+// =========================================================================
 // --- ФУНКЦИЯ НЕБЛОКИРУЮЩЕГО ЧТЕНИЯ ДАННЫХ ОТ ЭБУ ГБО ---
 // =========================================================================
 void collectGboData() {
@@ -579,18 +586,15 @@ void collectGboData() {
         break;
 
       case WAIT_0:
-        if (inByte == 0x00) gboState = WAIT_SIZE;
-        else gboState = WAIT_HEADER;
+        gboState = (inByte == 0x00) ? WAIT_SIZE : WAIT_HEADER;
         break;
 
       case WAIT_SIZE:
-        if (inByte == 0x53) gboState = WAIT_TYPE;
-        else gboState = WAIT_HEADER;
+        gboState = (inByte == 0x53) ? WAIT_TYPE : WAIT_HEADER;
         break;
 
       case WAIT_TYPE:
-        if (inByte == 0x01) gboState = READ_PAYLOAD;
-        else gboState = WAIT_HEADER;
+        gboState = (inByte == 0x01) ? READ_PAYLOAD : WAIT_HEADER;
         break;
 
       case READ_PAYLOAD:
@@ -625,27 +629,25 @@ void parseGboBuffer() {
   uint16_t sumInjPetrolX10 = gboBuf[6] + gboBuf[8] + gboBuf[10] + gboBuf[12];  // ms*10
   uint16_t sumInjLpgX10 = gboBuf[22] + gboBuf[24] + gboBuf[26] + gboBuf[28];   // ms*10
 
-  if (sumInjPetrolX10 > 0) {
-    uint64_t numeratorPetrolX10 = (uint64_t)sumInjPetrolX10 * rpmGBO * deltaTimeGboMs;
-    sumInjPetrolMs += (numeratorPetrolX10 + 600000ULL) / 1200000ULL;
-    while (sumInjPetrolMs >= 1000) {
-      activePetrol.totalInjSeconds++;
-      sumInjPetrolMs -= 1000;
-    }
-  }
-  if (sumInjLpgX10 > 0) {
-    uint64_t numeratorLpgX10 = (uint64_t)sumInjLpgX10 * rpmGBO * deltaTimeGboMs;
-    sumInjLpgMs += (numeratorLpgX10 + 600000ULL) / 1200000ULL;
-    while (sumInjLpgMs >= 1000) {
-      activeLpg.totalInjSeconds++;
-      sumInjLpgMs -= 1000;
-    }
-  }
-
   if (rpmGBO > 400 && sumInjLpgX10 > 8) isLpgActive = true;
   else isLpgActive = false;  // Едем на бензине (или мотор заглох)
 
-
+  if (!isLpgActive && sumInjPetrolX10 > 0) {
+    uint64_t numeratorPetrolX10 = (uint64_t)sumInjPetrolX10 * rpmGBO * deltaTimeGboMs;
+    remInjPetrolMs += (numeratorPetrolX10 + 600000ULL) / 1200000ULL;
+    while (remInjPetrolMs >= 1000) {
+      activePetrol.totalInjSeconds++;
+      remInjPetrolMs -= 1000;
+    }
+  }
+  if (isLpgActive && sumInjLpgX10 > 0) {
+    uint64_t numeratorLpgX10 = (uint64_t)sumInjLpgX10 * rpmGBO * deltaTimeGboMs;
+    remInjLpgMs += (numeratorLpgX10 + 600000ULL) / 1200000ULL;
+    while (remInjLpgMs >= 1000) {
+      activeLpg.totalInjSeconds++;
+      remInjLpgMs -= 1000;
+    }
+  }
   // --- Кадр 3203 (Все форсунки: 4 бензин + 4 газ) ---
   uint8_t frameInjections[8] = {
     gboBuf[6], gboBuf[8], gboBuf[10], gboBuf[12],   // Бензин 1-4
@@ -666,7 +668,7 @@ void parseGboBuffer() {
   };
   sendRealDashFrame(3204, frameEngine);
 }
-// == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == == =
+// =========================================================================
 // --- Функция проверки входяших данных от RealDash ---
 // =========================================================================
 void checkIncomingRealDashCAN() {
@@ -679,11 +681,13 @@ void checkIncomingRealDashCAN() {
 
       if (canId == 0x300) {               // данные по поездкам
         uint8_t fuelType = frameData[0];  // 1 - Бензин, 2 - Газ
-        uint8_t command = frameData[1];   // 1 - Заправка
-        float fuelAmount;
-        memcpy(&fuelAmount, &frameData[2], 4);
+        uint8_t command = frameData[1];   // 1 - Новая заправка, 2 - Изменение данных текущей поездки
+        uint16_t fuelRemainder;
+        uint16_t fuelAmount;
+        memcpy(&fuelRemainder, &frameData[2], 2);
+        memcpy(&fuelAmount, &frameData[3], 2);
 
-        if (command == 1) handleRefuelCommand(fuelType, fuelAmount);
+        if (command == 1) handleRefuelCommand(fuelType, fuelRemainder, fuelAmount);
       }
     }
   }
@@ -692,7 +696,7 @@ void checkIncomingRealDashCAN() {
 // --- Функция обработки команды (1) закрытия текущей и открытия новой  ---
 // --- поездки при заправке топлива                                     ---
 // =========================================================================
-void handleRefuelCommand(uint8_t fuelType, float fuelAmount) {
+void handleRefuelCommand(uint8_t fuelType, uint16_t fuelRemainder, uint16_t fuelAmount) {
   if (fuelType == 2) {
     activeLpg.status = 1;  // Закрыта
     activeLpg.endTime = systemUnixTime;
@@ -702,7 +706,8 @@ void handleRefuelCommand(uint8_t fuelType, float fuelAmount) {
     memset(&activeLpg, 0, sizeof(activeLpg));
     activeLpg.startTime = systemUnixTime;
     activeLpg.endTime = systemUnixTime;
-    activeLpg.initialFuelLiters = fuelAmount;
+    activeLpg.remainderFuelLitersX10 = fuelRemainder;
+    activeLpg.initialFuelLitersX10 = fuelAmount;
     activeLpg.fuelType = 2;
   } else if (fuelType == 1) {
     activePetrol.status = 1;
@@ -713,7 +718,8 @@ void handleRefuelCommand(uint8_t fuelType, float fuelAmount) {
     memset(&activePetrol, 0, sizeof(activePetrol));
     activePetrol.startTime = systemUnixTime;
     activePetrol.endTime = systemUnixTime;
-    activePetrol.initialFuelLiters = fuelAmount;
+    activeLpg.remainderFuelLitersX10 = fuelRemainder;
+    activePetrol.initialFuelLitersX10 = fuelAmount;
     activePetrol.fuelType = 1;
   }
   header.nextFreeIndex = (header.nextFreeIndex + 1) % MAX_HISTORY_RECORDS;
@@ -822,8 +828,9 @@ void validateActiveSession(uint8_t fuelType) {
     active->startTime = systemUnixTime;
     active->endTime = systemUnixTime;
     active->fuelType = fuelType;
-    active->initialFuelLiters = 0;  //= (fuelType == 2) ? 40.0f : 50.0f;
-    triggerRealDashAlert(1);        // Предупреждение: Сессия сброшена помехой
+    active->remainderFuelLitersX10 = 0;
+    active->initialFuelLitersX10 = 0;  //= (fuelType == 2) ? 40.0f : 50.0f;
+    triggerRealDashAlert(1);           // Предупреждение: Сессия сброшена помехой
   } else {
     if (fuelType == 2) activeLpg = tempRecord;
     else activePetrol = tempRecord;
@@ -1055,11 +1062,13 @@ void loop() {
   unsigned long currentMillis = millis();
 
   // Аппаратный секундный шаг внутренних "живых" часов
-  if (currentMillis - (lastClockTick * 1000) >= 1000) {
+  if (currentMillis - lastClockTick >= 1000) {
     systemUnixTime++;
-    lastClockTick++;
-    if (!isLpgActive && activePetrol.status == 0) activePetrol.durationSeconds++;
-    if (isLpgActive && activeLpg.status == 0) activeLpg.durationSeconds++;
+    lastClockTick += 1000;
+    if (rpm > 0) {
+      if (!isLpgActive && activePetrol.status == 0) activePetrol.durationSeconds++;
+      if (isLpgActive && activeLpg.status == 0) activeLpg.durationSeconds++;
+    }
   }
   // Фоновая синхронизация с физическим чипом RTC (Раз в 5 минут)
   if (currentMillis - lastRtcSync >= 300000) {
@@ -1213,7 +1222,6 @@ void loop() {
       if (!isRtcConnected) {
         adjustTime(sleepSecondsCount);
         systemUnixTime = now();
-        lastClockTick = systemUnixTime + 1;
       }
       checkWakeUpTriggers();
 
