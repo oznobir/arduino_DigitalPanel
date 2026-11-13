@@ -920,6 +920,153 @@ void triggerRealDashAlert(uint8_t errorCode) {
   sendRealDashFrame(3211, packet);
 }
 // =========================================================================
+// ФУНКЦИЯ ПОГРУЖЕНИЯ В СОН
+// useAlarm = true  -> спим с будильником (или WDT с лимитом времени) для STATE_PRE_SLEEP
+// useAlarm = false -> спим бесконечно (до клика/зажигания) для STATE_SLEEP
+// =========================================================================
+void enterDeepSleep(bool useAlarm, uint32_t maxSeconds) {
+  wakeUpIgnition = false;
+  wakeUpClickCount = 0;
+  wokenByRtc = false;
+  sleepSecondsCount = 0;
+
+  // Настраиваем RTC, пока шина I2C еще включена
+  if (useAlarm && isRtcConnected) {
+    DateTime alarmTime = rtcBackup.now() + TimeSpan(0, 0, 0, maxSeconds);
+    rtc.clearAlarm(1);
+    rtc.setAlarm1(alarmTime, DS3231_A1_Hour);
+  }
+
+  // Гасим всю периферию до входа в цикл сна
+  byte old_ADCSRA = sleepPeripherals();
+
+  // Цикл сна (для RTC выполнится 1 раз; для WDT будет тикать раз в секунду)
+  while (!wakeUpIgnition && wakeUpClickCount == 0 && !wokenByRtc) {
+    if (useAlarm && !isRtcConnected && sleepSecondsCount >= maxSeconds) {
+      break;  // Вышли по таймеру Watchdog (приставка пора выключать)
+    }
+
+    cli();
+    EIFR = (1 << INTF2) | (1 << INTF3);  // Сбрасываем старые флаги пинов 18 и 19
+    attachInterrupt(digitalPinToInterrupt(indicators[0].pin), wakeUpISR, LOW);
+    attachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER), doorTriggerISRSleep, LOW);
+
+    if (useAlarm && isRtcConnected) {
+      PCICR |= (1 << PCIE2);     // Включаем прерывание группы A8-A15
+      PCMSK2 |= (1 << PCINT16);  // Пин A8
+    }
+
+    // Если RTC не работает (в любом из стейтов) — включаем WDT для хода софт-часов
+    if (!isRtcConnected) {
+      wdt_reset();
+      WDTCSR |= (1 << WDCE) | (1 << WDE);
+      WDTCSR = (1 << WDIE) | (1 << WDP2) | (1 << WDP1);  // 1 секунда
+    }
+
+    set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+    sleep_enable();
+    sei();
+    sleep_cpu();  // <--- КОНТРОЛЛЕР ЗАСЫПАЕТ
+
+    // --- ТОЧКА ПРОБУЖДЕНИЯ ---
+    sleep_disable();
+    if (!isRtcConnected) wdt_disable();
+  }
+
+  // Отключаем внешние прерывания сна и поднимаем периферию (включая I2C!)
+  detachInterrupt(digitalPinToInterrupt(indicators[0].pin));
+  detachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER));
+  PCICR &= ~(1 << PCIE2);
+
+  wakeUpPeripherals(old_ADCSRA);
+
+  // Когда I2C снова работает, безопасно отключаем будильник в RTC
+  if (useAlarm && isRtcConnected) {
+    rtc.disableAlarm(1);
+    rtc.clearAlarm(1);
+  }
+}
+
+// =========================================================================
+// ФУНКЦИЯ АНАЛИЗА ПРИЧИНЫ ПРОБУЖДЕНИЯ
+// Возвращает true, если нужно выйти из loop() (поменяли стейт или идем дальше спать)
+// =========================================================================
+bool processWakeUpReason() {
+  // Вариант А: Разбудил ЦЗ (клики)
+  if (wakeUpClickCount > 0) {
+    lastWorkDebounceTime = micros();
+    EIFR = (1 << INTF2);
+    attachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER), doorTriggerISRWork, FALLING);
+
+    unsigned long windowTimer = millis();
+    int currentClicks = wakeUpClickCount;
+
+    while (millis() - windowTimer < TIMEOUT_WAIT_CLICK) {
+      // Если во время ожидания кликов повернули ключ зажигания — сразу едем!
+      if (digitalRead(indicators[0].pin) == LOW) {
+        detachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER));
+        wakeUpClickCount = 0;
+        wakeUpIgnition = false;
+        syncTimeManager(true);
+        currentState = STATE_DRIVE;
+        TEST_SERIAL.println(F("Зажигание во время кликов. Переход в DRIVE."));
+        return true;
+      }
+
+      if (wakeUpClickCount != currentClicks) {
+        currentClicks = wakeUpClickCount;
+        windowTimer = millis();
+      }
+    }
+
+    detachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER));
+    wakeUpClickCount = 0;
+
+    TEST_SERIAL.print(F("Всего зафиксировано кликов: "));
+    TEST_SERIAL.println(currentClicks);
+    TEST_SERIAL.flush();
+
+    if (currentClicks == 1) {
+      // 1 КЛИК = Точно едем! Проверяем АКБ перед запуском приставки
+      float batteryVoltage = readBatteryVoltageX10() * 0.1;
+
+      if (batteryVoltage > CRITICAL_BATTERY_VOLTAGE) {
+        // handleSmoothStart();  // ВКЛЮЧАЕМ BTS442
+        currentState = STATE_PRE_DRIVE_WAKE;
+        wakeUpTimerStart = millis();
+      } else {
+        TEST_SERIAL.println(F("Батарея разряжена..."));
+        TW2_SERIAL.print("\n\n");
+        delay(2000);
+        TW2_SERIAL.print("reboot -p\n");
+        delay(10000);
+        digitalWrite(PIN_ACC_OUTPUT, LOW);  // Обесточиваем приставку через BTS442
+
+        syncTimeManager(true);
+        currentState = STATE_SLEEP;  // Переходим в бесконечный сон
+      }
+    } else {
+      // Если 2 клика (закрыли) или больше — идем спать в бесконечный сон
+      // (если приставка еще была в mem, остаемся в PRE_SLEEP или переводим в SLEEP)
+      TEST_SERIAL.println(F("Кликов больше 1. Возврат в сон..."));
+    }
+    syncTimeManager(true);
+    return true;
+  }
+  // Вариант Б: Разбудил ключ зажигания напрямую
+  if (wakeUpIgnition) {
+    wakeUpIgnition = false;
+    if (digitalRead(indicators[0].pin) == LOW) {
+      syncTimeManager(true);
+      currentState = STATE_DRIVE;
+      TEST_SERIAL.println(F("Появилось зажигание. DRIVE."));
+      return true;
+    }
+  }
+  return false;  // Значит, сработал таймер будильника или WDT
+}
+
+// =========================================================================
 // --- Тестовая функция проверки чтения-записи данных в память ---
 // =========================================================================
 void testWriteReadFram() {
@@ -1083,7 +1230,6 @@ void loop() {
       if (digitalRead(PIN_ACC_OUTPUT) == LOW) handleSmoothStart();
       // ЗАПРОС В ЭБУ ГБО
       if (currentMillis - timerGboRequest >= INTERVAL_GBO_REQUEST) {
-        // Мгновенная отправка 4 байт, не блокирующая основной цикл
         GBO_SERIAL.write(GBO_QUERY, sizeof(GBO_QUERY));
         timerGboRequest = currentMillis;
       }
@@ -1094,7 +1240,6 @@ void loop() {
 
       // БЫСТРЫЕ ДАТЧИКИ
       if (currentMillis - timerFastSensors >= INTERVAL_FAST) {
-        // Вычисляем точное время, прошедшее с момента последнего расчета
         unsigned long timeElapsed = currentMillis - timerFastSensors;
         timerFastSensors = currentMillis;
         collectFastData(timeElapsed);
@@ -1140,7 +1285,6 @@ void loop() {
         syncTimeManager(true);
         currentState = STATE_PRE_SLEEP;
       }
-
       break;
 
     case STATE_SHUTDOWN:
@@ -1152,236 +1296,30 @@ void loop() {
       break;
 
     case STATE_PRE_SLEEP:
+      // Спим с активным таймером (через RTC или WDT)
+      enterDeepSleep(true, TANIX_SLEEP_DURATION / 1000UL);
 
-      // Настраиваем прерывания
-      EIFR = (1 << INTF2) | (1 << INTF3);  // Сбрасываем старые флаги пинов 18 и 19
-      attachInterrupt(digitalPinToInterrupt(indicators[0].pin), wakeUpISR, LOW);
-      attachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER), doorTriggerISRSleep, LOW);
-      byte old_ADCSRA = sleepPeripherals();
-      if (!isRtcConnected) {
-        // ЦИКЛ ГЛУБОКОГО СНА
-        while (!wakeUpIgnition && wakeUpClickCount == 0 && sleepSecondsCount < TANIX_SLEEP_DURATION / 1000) {
-          // Настройка регистров для Watchdog
-          cli();
-          wdt_reset();
-          WDTCSR |= (1 << WDCE) | (1 << WDE);
-          WDTCSR = (1 << WDIE) | (1 << WDP2) | (1 << WDP1);
-          sei();
+      // Разбудил ЦЗ или зажигание
+      if (processWakeUpReason()) return;
 
-          set_sleep_mode(SLEEP_MODE_PWR_DOWN);
-          sleep_enable();
-          sleep_cpu();  // Засыпаем...
+      // Сработал таймер выключения
+      wokenByRtc = false;
+      TW2_SERIAL.print("\n\n");
+      delay(2000);
+      TW2_SERIAL.print("reboot -p\n");
+      delay(10000);
+      digitalWrite(PIN_ACC_OUTPUT, LOW);  // Обесточиваем приставку через BTS442
 
-          // --- ПРОСНУЛИСЬ (от первого клика брелка, зажигания или Watchdog) ---
-          sleep_disable();
-          wdt_disable();
-        }
-      } else {
-        // НАСТРОЙКА БУДИЛЬНИКА НА +2 ЧАС
-        DateTime alarmTime = rtcBackup.now() + TimeSpan(0, 0, 0, (TANIX_SLEEP_DURATION / 1000UL));  // Дни, Часы, Минуты, Секунды
-        rtc.clearAlarm(1);
-        rtc.setAlarm1(alarmTime, DS3231_A1_Hour);
-
-        old_ADCSRA = sleepPeripherals(); 
-
-        // Настройка регистров для пина A8 - будильника RTC:
-        cli();
-        PCICR |= (1 << PCIE2);     // Включаем группу 2 (A8-A15)
-        PCMSK2 |= (1 << PCINT16);  // Привязываем конкретно к пину A8
-        sei();
-
-        set_sleep_mode(SLEEP_MODE_PWR_DOWN);
-        sleep_enable();
-        sleep_cpu();  // Засыпаем...
-
-        // --- ПРОСНУЛИСЬ (от первого клика брелка, зажигания, будильника) ---
-        sleep_disable();
-        PCICR &= ~(1 << PCIE2);  // Гасим прерывание будильника
-      }
-
-      detachInterrupt(digitalPinToInterrupt(indicators[0].pin));  //зажигание
-      detachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER));
-
-      wakeUpPeripherals(old_ADCSRA);
-
-      if (isRtcConnected) {
-        rtc.disableAlarm(1);  // Полностью выключаем будильник, он больше не нужен
-        rtc.clearAlarm(1);    // Очищаем будильник, чтобы он не спамил прерываниями
-      }
-
-      if (wakeUpClickCount > 0) {
-        lastWorkDebounceTime = micros();  // Отсекаем дребезг первого пробуждающего клика
-        EIFR = (1 << INTF2);              // Очищаем аппаратный флаг INT2 (пин 19)
-        // Перенастраиваем прерывание на FALLING (спад сигнала) с другой функцией.
-        attachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER), doorTriggerISRWork, FALLING);
-        unsigned long windowTimer = millis();
-        int currentClicks = wakeUpClickCount;
-
-        // Ждем клики в течение заданного интервала (TIMEOUT_WAIT_CLICK = 1 c)
-        while (millis() - windowTimer < TIMEOUT_WAIT_CLICK) {
-          if (digitalRead(indicators[0].pin) == LOW) {  // Если во время ожидания кликов повернули ключ — прерываем цикл
-            currentState = STATE_DRIVE;
-            return;
-          }
-          if (wakeUpClickCount != currentClicks) {
-            currentClicks = wakeUpClickCount;
-            windowTimer = millis();
-          }
-        }
-        detachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER));
-        wakeUpClickCount = 0;
-        // РАСПРЕДЕЛЕНИЕ ЛОГИКИ ПО КОЛИЧЕСТВУ КЛИКОВ:
-        TEST_SERIAL.print(F("Всего зафиксировано кликов: "));
-        TEST_SERIAL.println(currentClicks);
-        TEST_SERIAL.flush();
-        if (currentClicks == 1) {
-          // 1 КЛИК = Точно едем! Проверяем АКБ перед запуском приставки
-          float batteryVoltage = readBatteryVoltageX10() * 0.1;
-
-          if (batteryVoltage > CRITICAL_BATTERY_VOLTAGE) {
-            // handleSmoothStart();  // ВКЛЮЧАЕМ BTS442
-            currentState = STATE_PRE_DRIVE_WAKE;
-            wakeUpTimerStart = millis();
-          } else {
-            TEST_SERIAL.println(F("Батарея разряжена. STATE_SLEEP..."));
-            currentState = STATE_SLEEP;
-          }
-        } else if (currentClicks > 2) {
-          currentState = STATE_SLEEP;
-          TEST_SERIAL.println(F("Кликов больше 2. STATE_SLEEP..."));
-        }
-        syncTimeManager(true);
-        return;
-      }
-
-      if (wakeUpIgnition) {
-        wakeUpIgnition = false;
-        // Если проснулись от ключа зажигания, минуя ЦЗ (например, сидели внутри машины)
-        if (digitalRead(indicators[0].pin) == LOW) {
-          currentState = STATE_DRIVE;
-          TEST_SERIAL.println(F("Появилось зажигание. DRIVE."));
-        }
-        return;
-      }
-      // Если проснулись от будильника или Watchdog насчитал время пробуждения при нерабочем будильнике
-      if (wokenByRtc || (sleepSecondsCount >= TANIX_SLEEP_DURATION / 1000UL)) {
-        wokenByRtc = false;
-        TW2_SERIAL.print("\n\n");  // Коротко пинаем Tanix по UART, чтобы вывести процессор из состояния "mem"
-        delay(2000);
-        TW2_SERIAL.print("reboot -p\n");    // Отправляем команду полного завершения работы ОС
-        delay(10000);                       // 10 секунд на безопасную парковку eMMC-памяти
-        digitalWrite(PIN_ACC_OUTPUT, LOW);  // Жестко рубим силовое питание приставки через BTS442
-
-        syncTimeManager(true);
-        // Снова уходим в глубокий сон, но теперь в "бесконечный" (без будильника). В таком режиме машина может стоять месяцами
-        currentState = STATE_SLEEP;
-      }
+      syncTimeManager(true);
+      currentState = STATE_SLEEP;  // Переходим в бесконечный сон
 
       break;
 
     case STATE_SLEEP:
-      wakeUpIgnition = false;
-      wakeUpClickCount = 0;
-      sleepSecondsCount = 0;
-
-      old_ADCSRA = sleepPeripherals();
-      // Настраиваем прерывания
-      EIFR = (1 << INTF2) | (1 << INTF3);  // Сбрасываем старые флаги пинов 18 и 19
-      attachInterrupt(digitalPinToInterrupt(indicators[0].pin), wakeUpISR, LOW);
-      attachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER), doorTriggerISRSleep, LOW);
-
-
-      if (!isRtcConnected) {
-        // ЦИКЛ ГЛУБОКОГО СНА
-        while (!wakeUpIgnition && wakeUpClickCount == 0) {
-          // Настройка регистров для Watchdog
-          cli();
-          wdt_reset();
-          WDTCSR |= (1 << WDCE) | (1 << WDE);
-          WDTCSR = (1 << WDIE) | (1 << WDP2) | (1 << WDP1);
-          sei();
-
-          set_sleep_mode(SLEEP_MODE_PWR_DOWN);
-          sleep_enable();
-          sleep_cpu();  // Засыпаем...
-
-          // --- ПРОСНУЛИСЬ (от первого клика брелка, зажигания или Watchdog) ---
-          wdt_disable();
-          sleep_disable();
-        }
-      } else {
-        set_sleep_mode(SLEEP_MODE_PWR_DOWN);
-        sleep_enable();
-        sleep_cpu();  // Засыпаем...
-
-        // --- ПРОСНУЛИСЬ (от первого клика брелка, зажигания) ---
-        sleep_disable();
-      }
-      detachInterrupt(digitalPinToInterrupt(indicators[0].pin));  //зажигание
-      detachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER));
-
-      wakeUpPeripherals(old_ADCSRA);
-      if (isRtcConnected) {
-        rtc.disableAlarm(1);  // Полностью выключаем будильник, он больше не нужен
-        rtc.clearAlarm(1);    // Очищаем будильник, чтобы он не спамил прерываниями
-      }
-
-      syncTimeManager(true);
-
-      if (wakeUpClickCount > 0) {
-        lastWorkDebounceTime = micros();  // Отсекаем дребезг первого пробуждающего клика
-        EIFR = (1 << INTF2);              // Очищаем аппаратный флаг INT2 (пин 19)
-        // Перенастраиваем прерывание на FALLING (спад сигнала) с другой функцией.
-        attachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER), doorTriggerISRWork, FALLING);
-        unsigned long windowTimer = millis();
-        int currentClicks = wakeUpClickCount;
-
-        // Ждем клики в течение заданного интервала (TIMEOUT_WAIT_CLICK = 1 c)
-        while (millis() - windowTimer < TIMEOUT_WAIT_CLICK) {
-          if (digitalRead(indicators[0].pin) == LOW) {  // Если во время ожидания кликов повернули ключ — прерываем цикл
-            currentState = STATE_DRIVE;
-            return;
-          }
-          if (wakeUpClickCount != currentClicks) {
-            currentClicks = wakeUpClickCount;
-            windowTimer = millis();
-          }
-        }
-        detachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER));
-        wakeUpClickCount = 0;
-        // РАСПРЕДЕЛЕНИЕ ЛОГИКИ ПО КОЛИЧЕСТВУ КЛИКОВ:
-        TEST_SERIAL.print(F("Всего зафиксировано кликов: "));
-        TEST_SERIAL.println(currentClicks);
-        TEST_SERIAL.flush();
-        if (currentClicks == 1) {
-          // 1 КЛИК = Точно едем! Проверяем АКБ перед запуском приставки
-          float batteryVoltage = readBatteryVoltageX10() * 0.1;
-
-          if (batteryVoltage > CRITICAL_BATTERY_VOLTAGE) {
-            // handleSmoothStart();  // ВКЛЮЧАЕМ BTS442
-            currentState = STATE_PRE_DRIVE_WAKE;
-            wakeUpTimerStart = millis();
-          } else {
-            TEST_SERIAL.println(F("Батарея разряжена..."));
-            // currentState = STATE_SLEEP;
-          }
-        } else if (currentClicks > 2) {
-          // currentState = STATE_SLEEP;
-          TEST_SERIAL.println(F("Кликов больше 2. STATE_SLEEP..."));
-        }
-        syncTimeManager(true);
-        return;
-      }
-
-      if (wakeUpIgnition) {
-        wakeUpIgnition = false;
-        // Если проснулись от ключа зажигания, минуя ЦЗ (например, сидели внутри машины)
-        if (digitalRead(indicators[0].pin) == LOW) {
-          currentState = STATE_DRIVE;
-          TEST_SERIAL.println(F("Появилось зажигание. DRIVE."));
-        }
-        return;
-      }
+      // Бесконечный сон (без будильника; если RTC отвалился, WDT тикает для хода софт-часов)
+      enterDeepSleep(false, 0);
+      // Анализируем, кто разбудил (1 клик ЦЗ -> PRE_DRIVE_WAKE, зажигание -> DRIVE)
+      processWakeUpReason();
 
       break;
   }
