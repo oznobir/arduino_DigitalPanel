@@ -16,9 +16,9 @@
 // Arduino Mega Pro. Посекундные таймеры + Бинарный протокол RealDash CAN
 // =========================================================================
 
-#define RD_SERIAL Serial     // Порт к RealDash
-#define TEST_SERIAL Serial2  // Порт для тестов PuTTY
-#define TW2_SERIAL Serial3   // Порт к Tanix W2 через преобразователь 5v <=> 3.3v
+#define RD_SERIAL Serial      // Порт к RealDash
+#define TEST_SERIAL Serial2   // Порт для тестов PuTTY
+#define TANIX_SERIAL Serial3  // Порт к Tanix W2 через преобразователь 5v <=> 3.3v
 // #define GBO_SERIAL Serial3  // Порт к ЭБУ ГБО
 // #define PIN_RX_GBO = 15
 AltSoftSerial GBO_SERIAL;
@@ -83,6 +83,7 @@ const InputChannel indicators[INDICATORS_COUNT] = {
 // ==========================================================================
 
 enum SystemState {
+  STATE_STARTUP,
   STATE_PRE_SLEEP,
   STATE_SLEEP,
   STATE_PRE_DRIVE_WAKE,
@@ -119,7 +120,6 @@ struct HistoryRecord {
   uint32_t endTime;
   uint32_t distanceMeters;
   uint32_t totalInjSeconds;
-  uint32_t durationSeconds;
   uint16_t remainderFuelLitersX10;
   uint16_t initialFuelLitersX10;
   uint8_t fuelType;  // 1 - Бензин, 2 - Газ
@@ -156,14 +156,25 @@ HistoryRecord activePetrol;
 bool isLpgActive = false;
 bool isRtcConnected = false;
 
-const float CRITICAL_BATTERY_VOLTAGE = 11.7;  // Порог защиты аккумулятора от разряда (Вольты)
+const byte UART_TANIX_BUFFER_SIZE = 128;
+char uartTanixBuffer[UART_TANIX_BUFFER_SIZE];  // Буфер под одну строку из консоли Tanix
+byte uartTanixIndex = 0;
 
+uint8_t rdRxBuffer[16];  // Буфер под пакет из Realdash
+uint8_t rdRxIndex = 0;
+
+unsigned long bootStartTanixTime = 0;
+// Флаги состояния приставки
+bool isTanixBooted = false;
+
+const uint8_t CRITICAL_BATTERY_VOLTAGE_X10 = 117;   // Порог защиты аккумулятора от разряда (Вольты * 10)
 const unsigned long TIMEOUT_WAIT_IGNITION = 10000;  // Время ожидания зажигания
 const unsigned long TIMEOUT_WAIT_CLICK = 1000;      // Время ожидания сигнала ЦЗ
 const unsigned long DEBOUNCE_DELAY = 250;           // Игнорируем помехи короче 250 мс
 const unsigned long MAX_SHUTDOWN_TIMEOUT = 15000;
-const unsigned long TIMEOUT_WAIT_UART_SILENCE = 2500;
+// const unsigned long TIMEOUT_WAIT_UART_SILENCE = 2500;
 const unsigned long TANIX_SLEEP_DURATION = 7200000;
+const unsigned long TIMEOUT_TANIX_BOOT_START = 40000;
 
 volatile int wakeUpClickCount = 0;             // Переменная счетчика нажатий ЦЗ
 volatile unsigned long sleepSecondsCount = 0;  // Переменная счетчика секунд, если RTC не работает
@@ -182,10 +193,10 @@ unsigned long timerSlowSensors = 0;
 unsigned long timerGboRequest = 0;
 unsigned long timerGboInj = 90;
 
-unsigned long lastClockTick = 0;
 unsigned long lastRtcSync = 0;
 unsigned long lastSaveTime = 0;
 unsigned long lastUartDataMillis = 0;
+unsigned long tanixTargetShutdownUnix = 0;  // Абсолютное время (Unix), когда приставка должна уснуть в SLEEP
 
 const unsigned long INTERVAL_FAST = 100;
 const unsigned long INTERVAL_NORM = 1500;
@@ -218,6 +229,7 @@ unsigned int rawECT = 0;
 unsigned int rawFuel = 0;
 uint8_t tempInterP40 = 0;
 uint8_t tempOuterP40 = 0;
+uint8_t tempBoardP40 = 0;
 uint32_t byteIndicators = 0;
 unsigned int rpmGBO = 0;
 uint16_t remInjPetrolMs = 0;
@@ -260,7 +272,6 @@ void sendRealDashText(unsigned long canTextId, const char* text) {
 //     }
 //   }
 // }
-
 // =========================================================================
 // --- Функция подсчета контрольной суммы (CRC8, CRC32 или аналог) ---
 // =========================================================================
@@ -276,7 +287,7 @@ uint32_t calculateCRC(uint8_t* data, size_t len) {
   return ~crc;
 }
 uint8_t calculateCRC8(const uint8_t* data, size_t length) {
-  uint8_t crc = 0x00;
+  uint8_t crc = 0xFF;
   for (size_t i = 0; i < length; i++) {
     crc ^= data[i];
     for (uint8_t j = 0; j < 8; j++) {
@@ -291,7 +302,7 @@ uint8_t calculateCRC8(const uint8_t* data, size_t length) {
 // =========================================================================
 uint8_t readBatteryVoltageX10() {
   analogRead(PIN_BATTERY_SENSE);  // Dummy Read (прогрев АЦП)
-
+  delayMicroseconds(100);
   uint16_t rawSum = 0;
   for (int i = 0; i < 10; i++) {
     rawSum += analogRead(PIN_BATTERY_SENSE);
@@ -322,11 +333,11 @@ void handleSmoothStart() {
 // =========================================================================
 byte sleepPeripherals() {
   RD_SERIAL.flush();
-  TW2_SERIAL.flush();
+  TANIX_SERIAL.flush();
   TEST_SERIAL.flush();
   // GBO_SERIAL.flush();
   RD_SERIAL.end();
-  TW2_SERIAL.end();
+  TANIX_SERIAL.end();
   TEST_SERIAL.end();
   // GBO_SERIAL.end();
 
@@ -363,6 +374,12 @@ byte sleepPeripherals() {
 
   pinMode(20, INPUT);  // SDA
   pinMode(21, INPUT);  // SCL
+  digitalWrite(20, LOW);
+  digitalWrite(21, LOW);
+
+  pinMode(PIN_ONE_WIRE, INPUT);
+  digitalWrite(PIN_ONE_WIRE, LOW);  // Гарантированно выключаем внутренний pull-up
+
   return old;
 }
 // =========================================================================
@@ -389,11 +406,12 @@ void wakeUpPeripherals(const byte old) {
   power_usart2_enable();
 
   RD_SERIAL.begin(115200);
-  TW2_SERIAL.begin(115200);
+  TANIX_SERIAL.begin(115200);
   TEST_SERIAL.begin(115200);
   // GBO_SERIAL.begin(9600);
   // pinMode(PIN_RX_GBO, INPUT_PULLUP);  // Подтяжка RX линии GBO_SERIAL
   sensors.begin();
+  delay(5);
   Wire.begin();
 }
 // =========================================================================
@@ -427,6 +445,40 @@ void rpmPulseCounter() {
 }
 void speedPulseCounter() {
   speedPulses++;
+}
+// =========================================================================
+// --- ФУНКЦИЯ ПОЛУЧЕНИЯ И ОТПРАВКИ ВСЕХ ДАННЫХ ---
+// =========================================================================
+void collectData(bool allData = false) {
+  unsigned long currentMillis = millis();
+  if (allData) {
+    if (currentMillis - timerGboRequest >= INTERVAL_GBO_REQUEST) {
+      GBO_SERIAL.write(GBO_QUERY, sizeof(GBO_QUERY));
+      timerGboRequest = currentMillis;
+    }
+
+    collectGboData();
+  }
+  // БЫСТРЫЕ ДАТЧИКИ
+  if (currentMillis - timerFastSensors >= INTERVAL_FAST) {
+    unsigned long timeElapsed = currentMillis - timerFastSensors;
+    timerFastSensors = currentMillis;
+    collectFastData(timeElapsed);  // и в STATE_PRE_DRIVE_WAKE потом разделить
+  }
+  // СТАНДАРТНЫЕ ДАТЧИКИ
+  if (currentMillis - timerNormSensors >= INTERVAL_NORM) {
+    timerNormSensors = currentMillis;
+    collectNormData();  // и в STATE_PRE_DRIVE_WAKE
+  }
+  // МЕДЛЕННЫЕ ДАТЧИКИ
+  if (currentMillis - timerSlowSensors >= INTERVAL_SLOW) {
+    timerSlowSensors = currentMillis;
+    collectSlowData();  // и в STATE_PRE_DRIVE_WAKE
+  }
+  if (currentMillis - lastSaveTime >= INTERVAL_BACKUP_FRAM) {
+    lastSaveTime = currentMillis;
+    backupDataToFram();  // и в STATE_PRE_DRIVE_WAKE
+  }
 }
 // =========================================================================
 // --- ФУНКЦИЯ ПОЛУЧЕНИЯ И ОТПРАВКИ БЫСТРЫХ ДАННЫХ ---
@@ -533,9 +585,9 @@ void collectNormData() {
   // float curLpgLiters = max(0.0f, activeLpg.initialFuelLiters - ((float)activeLpg.totalInjMs * LPG_LITERS_PER_MS));
   // float curPetrolLiters = max(0.0f, activePetrol.initialFuelLiters - ((float)activePetrol.totalInjMs * PETROL_LITERS_PER_MS));
   // 12,5 л на 100 км
-  uint16_t curLpgLitersX10 = max(0, activeLpg.remainderFuelLitersX10 + activeLpg.initialFuelLitersX10 - (uint16_t)(tripLpgKm * 125 + 500) / 1000);
+  uint16_t curLpgLitersX10 = max(0, activeLpg.remainderFuelLitersX10 + activeLpg.initialFuelLitersX10 - (uint16_t)(tripLpgKm * 125 + 50) / 100);
   // 10,5 л на 100 км
-  uint16_t curPetrolLitersX10 = max(0, activePetrol.remainderFuelLitersX10 + activePetrol.initialFuelLitersX10 - (uint16_t)(tripPetrolKm * 105 + 500) / 1000);
+  uint16_t curPetrolLitersX10 = max(0, activePetrol.remainderFuelLitersX10 + activePetrol.initialFuelLitersX10 - (uint16_t)(tripPetrolKm * 105 + 50) / 100);
 
   uint8_t data3207[8] = { 0 };
   memcpy(data3207, &curLpgLitersX10, 2);
@@ -569,12 +621,16 @@ void collectSlowData() {
   tempOuterP40 = (rawOuter == DEVICE_DISCONNECTED_C || rawOuter < -40.0) ? 0 : (uint8_t)(rawOuter + 40.5);
   sensors.requestTemperatures();  // Даем команду датчикам начать НОВОЕ измерение в фоне (займет 0 мс ожидания!)
 
+  float rtcTemp = rtc.getTemperature();
+  tempBoardP40 = (uint8_t)(rtcTemp + 40.5);
+
   uint8_t data3201[8] = { 0 };
   memcpy(data3201, &rawECT, 2);
   memcpy(data3201 + 2, &rawFuel, 2);
   memcpy(data3201 + 4, &voltageX10, 1);
   memcpy(data3201 + 5, &tempInterP40, 1);
   memcpy(data3201 + 6, &tempOuterP40, 1);
+  memcpy(data3201 + 7, &tempBoardP40, 1);
 
   // Отправка в RealDash
   sendRealDashFrame(3201, data3201);
@@ -594,6 +650,9 @@ void collectSlowData() {
   TEST_SERIAL.println(F(" °C"));
   TEST_SERIAL.print(F(" | Улица: "));
   TEST_SERIAL.print((tempOuterP40 - 40), 1);
+  TEST_SERIAL.println(F(" °C"));
+  TEST_SERIAL.print(F(" | Плата МК: "));
+  TEST_SERIAL.print((tempBoardP40 - 40), 1);
   TEST_SERIAL.println(F(" °C"));
   TEST_SERIAL.println(F("-----------------------------------"));
 }
@@ -688,25 +747,69 @@ void parseGboBuffer() {
 // --- Функция проверки входяших данных от RealDash ---
 // =========================================================================
 void checkIncomingRealDashCAN() {
-  if (Serial.available() >= 16) {
-    if (Serial.read() == 0x44 && Serial.read() == 0x33 && Serial.read() == 0x22 && Serial.read() == 0x11) {
-      uint32_t canId;
-      Serial.readBytes((char*)&canId, 4);
-      uint8_t frameData[8];
-      Serial.readBytes((char*)frameData, 8);
+  if (millis() - bootStartTanixTime > TIMEOUT_TANIX_BOOT_START) {  //40000
+    isTanixBooted = true;
+  }
+  while (RD_SERIAL.available()) {
+    uint8_t b = RD_SERIAL.read();
+    // Ищем начало 16-байтного заголовка RealDash CAN: 0x44 0x33 0x22 0x11
+    if (rdRxIndex == 0 && b != 0x44) {
+      continue;
+    }
+    if (rdRxIndex == 1 && b != 0x33) {
+      rdRxIndex = 0;
+      continue;
+    }
+    if (rdRxIndex == 2 && b != 0x22) {
+      rdRxIndex = 0;
+      continue;
+    }
+    if (rdRxIndex == 3 && b != 0x11) {
+      rdRxIndex = 0;
+      continue;
+    }
 
-      if (canId == 0x300) {               // данные по поездкам
-        uint8_t fuelType = frameData[0];  // 1 - Бензин, 2 - Газ
-        uint8_t command = frameData[1];   // 1 - Новая заправка, 2 - Изменение данных текущей поездки
+    rdRxBuffer[rdRxIndex++] = b;
+    // Когда собрали все 16 байт пакета
+    if (rdRxIndex == 16) {
+      rdRxIndex = 0;
+      // Собираем 32-битный CAN ID из байтов 4..7 (Little-Endian)
+      uint32_t canId = (uint32_t)rdRxBuffer[4] | ((uint32_t)rdRxBuffer[5] << 8) | ((uint32_t)rdRxBuffer[6] << 16) | ((uint32_t)rdRxBuffer[7] << 24);
+      // Если пришел наш пакет готовности 0x7FF
+      if (canId == 3220) {
+        isTanixBooted = true;
+      }
+      if (canId == 3221) {                 // данные по поездкам
+        uint8_t fuelType = rdRxBuffer[0];  // 1 - Бензин, 2 - Газ
+        uint8_t command = rdRxBuffer[1];   // 1 - Новая заправка, 2 - Изменение данных текущей поездки
         uint16_t fuelRemainder;
         uint16_t fuelAmount;
-        memcpy(&fuelRemainder, &frameData[2], 2);
-        memcpy(&fuelAmount, &frameData[3], 2);
+        memcpy(&fuelRemainder, &rdRxBuffer[2], 2);
+        memcpy(&fuelAmount, &rdRxBuffer[3], 2);
 
         if (command == 1) handleRefuelCommand(fuelType, fuelRemainder, fuelAmount);
       }
     }
   }
+  // if (Serial.available() >= 16) {
+  //   if (Serial.read() == 0x44 && Serial.read() == 0x33 && Serial.read() == 0x22 && Serial.read() == 0x11) {
+  //     uint32_t canId;
+  //     Serial.readBytes((char*)&canId, 4);
+  //     uint8_t frameData[8];
+  //     Serial.readBytes((char*)frameData, 8);
+
+  //     if (canId == 0x300) {               // данные по поездкам
+  //       uint8_t fuelType = frameData[0];  // 1 - Бензин, 2 - Газ
+  //       uint8_t command = frameData[1];   // 1 - Новая заправка, 2 - Изменение данных текущей поездки
+  //       uint16_t fuelRemainder;
+  //       uint16_t fuelAmount;
+  //       memcpy(&fuelRemainder, &frameData[2], 2);
+  //       memcpy(&fuelAmount, &frameData[3], 2);
+
+  //       if (command == 1) handleRefuelCommand(fuelType, fuelRemainder, fuelAmount);
+  //     }
+  //   }
+  // }
 }
 // =========================================================================
 // --- Функция обработки команды (1) закрытия текущей и открытия новой  ---
@@ -777,23 +880,6 @@ void syncTimeManager(bool syncNow = false) {
     }
   }
 }
-// void syncWithPhysicalRTC() {
-//   if (Wire.getWireTimeoutFlag()) {
-//     Wire.clearWireTimeoutFlag();
-//     isRtcConnected = false;
-//     triggerRealDashAlert(3);
-//     return;
-//   }
-//   Wire.beginTransmission(0x68);
-//   if (Wire.endTransmission() == 0) {
-//     uint32_t exactTime = rtc.now().unixtime();
-//     rtcBackup.begin(exactTime);
-//     isRtcConnected = true;
-//   } else {
-//     isRtcConnected = false;
-//     triggerRealDashAlert(3);
-//   }
-// }
 // =========================================================================
 // --- Функция инициализации и проверки памяти ---
 // =========================================================================
@@ -986,7 +1072,6 @@ void enterDeepSleep(bool useAlarm, uint32_t maxSeconds) {
     rtc.clearAlarm(1);
   }
 }
-
 // =========================================================================
 // ФУНКЦИЯ АНАЛИЗА ПРИЧИНЫ ПРОБУЖДЕНИЯ
 // Возвращает true, если нужно выйти из loop() (поменяли стейт или идем дальше спать)
@@ -1007,18 +1092,16 @@ bool processWakeUpReason() {
         detachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER));
         wakeUpClickCount = 0;
         wakeUpIgnition = false;
-        syncTimeManager(true);
+        ensureTanixPowerOn();
         currentState = STATE_DRIVE;
         TEST_SERIAL.println(F("Зажигание во время кликов. Переход в DRIVE."));
         return true;
       }
-
       if (wakeUpClickCount != currentClicks) {
         currentClicks = wakeUpClickCount;
         windowTimer = millis();
       }
     }
-
     detachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER));
     wakeUpClickCount = 0;
 
@@ -1026,44 +1109,158 @@ bool processWakeUpReason() {
     TEST_SERIAL.println(currentClicks);
     TEST_SERIAL.flush();
 
-    if (currentClicks == 1) {
-      // 1 КЛИК = Точно едем! Проверяем АКБ перед запуском приставки
-      float batteryVoltage = readBatteryVoltageX10() * 0.1;
-
-      if (batteryVoltage > CRITICAL_BATTERY_VOLTAGE) {
-        // handleSmoothStart();  // ВКЛЮЧАЕМ BTS442
+    if (currentClicks == 1) {      // 1 КЛИК = Точно едем!
+      if (ensureTanixPowerOn()) {  // Проверяем АКБ и запускаем приставку
         currentState = STATE_PRE_DRIVE_WAKE;
         wakeUpTimerStart = millis();
       } else {
-        TEST_SERIAL.println(F("Батарея разряжена..."));
-        TW2_SERIAL.print("\n\n");
-        delay(2000);
-        TW2_SERIAL.print("reboot -p\n");
-        delay(10000);
-        digitalWrite(PIN_ACC_OUTPUT, LOW);  // Обесточиваем приставку через BTS442
-
         syncTimeManager(true);
         currentState = STATE_SLEEP;  // Переходим в бесконечный сон
       }
     } else {
       // Если 2 клика (закрыли) или больше — идем спать в бесконечный сон
-      // (если приставка еще была в mem, остаемся в PRE_SLEEP или переводим в SLEEP)
+      // (если приставка еще была в mem, остаемся в PRE_SLEEP или в SLEEP)
       TEST_SERIAL.println(F("Кликов больше 1. Возврат в сон..."));
+      syncTimeManager(true);
     }
-    syncTimeManager(true);
     return true;
   }
   // Вариант Б: Разбудил ключ зажигания напрямую
   if (wakeUpIgnition) {
     wakeUpIgnition = false;
     if (digitalRead(indicators[0].pin) == LOW) {
-      syncTimeManager(true);
+      ensureTanixPowerOn();
       currentState = STATE_DRIVE;
       TEST_SERIAL.println(F("Появилось зажигание. DRIVE."));
       return true;
     }
   }
   return false;  // Значит, сработал таймер будильника или WDT
+}
+// =========================================================================
+// --- Функция безопасного включения питания приставки   ---
+// --- (для холодного и горячего старта)                 ---
+// =========================================================================
+bool ensureTanixPowerOn() {
+  if (digitalRead(PIN_ACC_OUTPUT) == HIGH) {  // Проверяем, не включено ли уже питание
+    TEST_SERIAL.println(F("Питание приставки уже подано. Будим по UART..."));
+    // if (currentState == STATE_PRE_SLEEP) TANIX_SERIAL.print("\n\n");  // Короткий импульс в консоль выводит Android из сна "mem"
+    if (!tryWakeUpTanix()) {  // Консоль не отвечает - значит зависла
+      digitalWrite(PIN_ACC_OUTPUT, LOW);
+      delay(500);
+      handleSmoothStart();  // Включаем BTS442, попробовать digitalWrite(PIN_ACC_OUTPUT, HIGH) - конденсаторы ведь заряжены
+      bootStartTanixTime = millis();
+      isTanixBooted = false;
+    }
+    return true;
+  }
+  // Если нет зажигания и питание было выключено, проверяем АКБ перед холодным стартом.
+  if ((digitalRead(indicators[0].pin) == HIGH) && (readBatteryVoltageX10() <= CRITICAL_BATTERY_VOLTAGE_X10)) {
+    TEST_SERIAL.print(F("Отмена запуска! Низкий заряд АКБ."));
+    TEST_SERIAL.flush();
+    return false;  // Запрещаем запуск при разряженной батарее
+  }
+  bootStartTanixTime = millis();
+  isTanixBooted = false;
+  TEST_SERIAL.println(F("Холодный старт: включаем ключ BTS442..."));
+  handleSmoothStart();  // Включаем BTS442
+
+  return true;
+}
+// =========================================================================
+// --- Функция: пытается разбудить приставку из сна по UART       ---
+// --- (Возвращает true, если проснулась, и false, если зависла)  ---
+// =========================================================================
+bool tryWakeUpTanix() {
+  for (int attempt = 0; attempt < 3; attempt++) {
+    while (TANIX_SERIAL.available()) TANIX_SERIAL.read();  // Чистим буфер
+    TANIX_SERIAL.print("\n\n");
+    unsigned long start = millis();
+    while (millis() - start < 1500) {
+      if (TANIX_SERIAL.available()) return true;  // Успешно проснулась!
+    }
+  }
+  return false;  // За 3 попытки не ответила
+}
+// =========================================================================
+// --- Функция штатного выключения приставки по UART       ---
+// =========================================================================
+void powerOffTanix() {
+  uartTanixIndex = 0;
+  while (TANIX_SERIAL.available()) TANIX_SERIAL.read();  // Чистим буфер
+  TANIX_SERIAL.println(F("reboot -p"));
+  unsigned long start = millis();
+  while (millis() - start < 8000) {
+    if (readUartTanixLine(200)) {
+      if (strstr(uartTanixBuffer, "reboot: Power down") != NULL || strstr(uartTanixBuffer, "System halted") != NULL) {
+        delay(300);
+        break;
+      }
+    }
+  }
+  digitalWrite(PIN_ACC_OUTPUT, LOW);  // В любом случае выключаем питание
+}
+// =========================================================================
+// --- Функция-приемщик строк от uart Tanix W2  с таймаутом  ---
+// =========================================================================
+bool readUartTanixLine(unsigned long timeoutMs) {
+  unsigned long start = millis();
+  while (millis() - start < timeoutMs) {
+    while (TANIX_SERIAL.available()) {
+      char c = TANIX_SERIAL.read();
+      TEST_SERIAL.write(c);  // Дублируем весь поток в монитор порта ПК для отладки
+      if (c == '\n') {
+        uartTanixBuffer[uartTanixIndex] = '\0';  // Завершаем C-строку
+        TEST_SERIAL.write(uartTanixBuffer, sizeof(uartTanixBuffer));
+        uartTanixIndex = 0;
+        return true;  // Собрана целая строка
+      } else if (c != '\r') {
+        if (uartTanixIndex < UART_TANIX_BUFFER_SIZE - 1) {
+          uartTanixBuffer[uartTanixIndex++] = c;
+        }
+      }
+    }
+  }
+  return false;  // Таймаут: целая строка не пришла
+}
+// =========================================================================
+// --- Функция отправки Tanix W2 в сон ---
+// =========================================================================
+bool sleepTanix() {
+  // Делаем 2 попытки усыпить (на случай если в первый раз помешал wakelock)
+  for (int attempt = 0; attempt < 2; attempt++) {
+    uartTanixIndex = 0;
+    while (TANIX_SERIAL.available()) TANIX_SERIAL.read();  // Чистим буфер
+    TANIX_SERIAL.println("input keyevent 223");
+    // Ждем до 7 секунд маркер ядра "Suspending console"
+    unsigned long start = millis();
+    while (millis() - start < 7000) {
+      if (readUartTanixLine(200)) {
+        if (strstr(uartTanixBuffer, "Suspending console") != NULL) {
+          break;  // Поймали лог начала сна!
+        }
+      }
+    }
+
+    delay(250);  // Даем ядру завершить отключение UART
+    while (TANIX_SERIAL.available()) TANIX_SERIAL.read();
+    // Контрольный пинг: шлем Enter и ждем 1.5 секунды полной тишины
+    TANIX_SERIAL.println("");
+    unsigned long silenceStart = millis();
+
+    bool responded = false;
+    while (millis() - silenceStart < 1500) {
+      if (TANIX_SERIAL.available()) {
+        responded = true;  // Ответила -> не уснула
+        break;
+      }
+    }
+    if (!responded) {  // Успешно уснула!
+      return true;
+    }
+  }
+  // Тут, видимо, нужно перегрузить приставку?
+  return false;
 }
 
 // =========================================================================
@@ -1107,7 +1304,7 @@ void sendTimeToSerial() {
 
 void setup() {
   // setTime(12, 0, 0, 1, 1, 2026);
-  TW2_SERIAL.begin(115200);
+  TANIX_SERIAL.begin(115200);
   TEST_SERIAL.begin(115200);
   GBO_SERIAL.begin(9600);
   // pinMode(PIN_RX_GBO, INPUT_PULLUP);  // Подтяжка RX линии GBO_SERIAL
@@ -1135,6 +1332,10 @@ void setup() {
   for (int i = 0; i < INDICATORS_COUNT; i++) pinMode(indicators[i].pin, INPUT_PULLUP);
 
   sensors.begin();
+  sensors.setResolution(11);            // Разрешение 0.125 °C (конверсия 375 мс, для салона/улицы идеально)
+  sensors.setWaitForConversion(false);  // ОТКЛЮЧАЕМ БЛОКИРОВКУ ПРОЦЕССОРА!
+  sensors.requestTemperatures();        // Запускаем самый первый замер заранее
+
 
   Wire.begin();                     // Инициализация I2C шины для Mega (пины 20 и 21 инициализируются автоматически)
   Wire.setWireTimeout(3000, true);  // Безопасный запуск I2C с аппаратным таймаутом
@@ -1161,8 +1362,8 @@ void setup() {
   if (fram.begin()) {  // Запуск и валидация памяти FRAM
     systemMemoryInitAndValidate();
   }
-  // currentState = STATE_PRE_DRIVE_WAKE;
-  wakeUpTimerStart = millis();
+  if (!ensureTanixPowerOn()) currentState = STATE_SLEEP;
+  else wakeUpTimerStart = millis();  // currentState = STATE_PRE_DRIVE_WAKE;
 
   TEST_SERIAL.println(F("Система загружена"));
 }
@@ -1174,141 +1375,94 @@ void setup() {
 void loop() {
 
   syncTimeManager();
+  checkIncomingRealDashCAN();  // Слушаем входящие команды из RealDash
 
   // =========================================================================
   // --- АВТОМАТ СОСТОЯНИЙ ПИТАНИЯ ---
   // =========================================================================
 
-  unsigned long currentMillis = millis();
+
   bool isIgnitionOn = (digitalRead(indicators[0].pin) == LOW);
 
   switch (currentState) {
 
     case STATE_PRE_DRIVE_WAKE:
 
-      if (digitalRead(PIN_ACC_OUTPUT) == LOW) handleSmoothStart();
-
-      checkIncomingRealDashCAN();  // Слушаем входящие команды из RealDash
-
-      // БЫСТРЫЕ ДАТЧИКИ
-      if (currentMillis - timerFastSensors >= INTERVAL_FAST) {
-        // Вычисляем точное время, прошедшее с момента последнего расчета
-        unsigned long timeElapsed = currentMillis - timerFastSensors;
-        timerFastSensors = currentMillis;
-        collectFastData(timeElapsed);
-      }
-      // СТАНДАРТНЫЕ ДАТЧИКИ
-      if (currentMillis - timerNormSensors >= INTERVAL_NORM) {
-        timerNormSensors = currentMillis;
-        collectNormData();
-      }
-      // МЕДЛЕННЫЕ ДАТЧИКИ
-      if (currentMillis - timerSlowSensors >= INTERVAL_SLOW) {
-        timerSlowSensors = currentMillis;
-        collectSlowData();
-      }
-      if (currentMillis - lastSaveTime >= INTERVAL_BACKUP_FRAM) {
-        lastSaveTime = currentMillis;
-        backupDataToFram();
-      }
+      collectData();
       // Ждем зажигания в течение минут
       if (isIgnitionOn) {
         currentState = STATE_DRIVE;
         TEST_SERIAL.println(F("Состояние изменено на DRIVE."));
 
       } else if (millis() - wakeUpTimerStart >= TIMEOUT_WAIT_IGNITION) {
-
-        TW2_SERIAL.print("su -c \"echo mem > /sys/power/state\"\n");  // Отправляем Tanix команду ухода в сон через UART консоль
-        currentState = STATE_SHUTDOWN;
-        TEST_SERIAL.println(F("Состояние изменено на SHUTDOWN. Вышло время"));
+        backupDataToFram();
+        // TANIX_SERIAL.print("su -c \"echo mem > /sys/power/state\"\n");  // Отправляем Tanix команду ухода в сон через UART консоль
+        if (sleepTanix()) {
+          currentState = STATE_PRE_SLEEP;
+          syncTimeManager(true);
+          tanixTargetShutdownUnix = rtcBackup.now().unixtime() + (TANIX_SLEEP_DURATION / 1000UL);
+          TEST_SERIAL.println(F("Вышло время. STATE_PRE_SLEEP"));
+        } else {
+          powerOffTanix();
+          currentState = STATE_SLEEP;
+          TEST_SERIAL.println(F("Вышло время и Tanix не смог уснуть. STATE_SLEEP"));
+        }
       }
 
       break;
 
     case STATE_DRIVE:
 
-      if (digitalRead(PIN_ACC_OUTPUT) == LOW) handleSmoothStart();
-      // ЗАПРОС В ЭБУ ГБО
-      if (currentMillis - timerGboRequest >= INTERVAL_GBO_REQUEST) {
-        GBO_SERIAL.write(GBO_QUERY, sizeof(GBO_QUERY));
-        timerGboRequest = currentMillis;
-      }
-
-      collectGboData();
-
-      checkIncomingRealDashCAN();  // Слушаем входящие команды из RealDash
-
-      // БЫСТРЫЕ ДАТЧИКИ
-      if (currentMillis - timerFastSensors >= INTERVAL_FAST) {
-        unsigned long timeElapsed = currentMillis - timerFastSensors;
-        timerFastSensors = currentMillis;
-        collectFastData(timeElapsed);
-      }
-      // СТАНДАРТНЫЕ ДАТЧИКИ
-      if (currentMillis - timerNormSensors >= INTERVAL_NORM) {
-        timerNormSensors = currentMillis;
-        collectNormData();
-      }
-      // МЕДЛЕННЫЕ ДАТЧИКИ
-      if (currentMillis - timerSlowSensors >= INTERVAL_SLOW) {
-        timerSlowSensors = currentMillis;
-        collectSlowData();
-      }
-      if (currentMillis - lastSaveTime >= INTERVAL_BACKUP_FRAM) {
-        lastSaveTime = currentMillis;
-        backupDataToFram();
-      }
-      // В режиме поездки нам плевать на любые клацанья ЦЗ или дверей. Мы смотрим только на зажигание.
+      collectData(true);
+      // В режиме поездки смотрим только на зажигание.
       if (!isIgnitionOn) {
         backupDataToFram();
-        TW2_SERIAL.print("su -c \"echo mem > /sys/power/state\"\n");  // Отправляем Tanix команду ухода в сон через UART консоль
-        // время в Tanix
-        // uint32_t unixTime = rtcBackup.now().unixtime();
-        // // Команда date -s @<timestamp> работает в стандартном BusyBox Android/Linux
-        // TW2_SERIAL.print(F("su -c \"date -s @"));
-        // TW2_SERIAL.print(unixTime);
-        // TW2_SERIAL.println(F("\""));
-        // время от Tanix
-        // TW2_SERIAL.println(F("echo TIME:$(date +%s)")); // Отправляем Tanix команду запроса текущего Unix-времени
-        unsigned long windowTimer = millis();
-        while (millis() - windowTimer < TIMEOUT_WAIT_UART_SILENCE) {
-          if (TW2_SERIAL.available() > 0) {
-            while (TW2_SERIAL.available() > 0) {
-              // TW2_SERIAL.read();
-              char inByte = TW2_SERIAL.read();  // Считываем байт из буфера ПК
-              TEST_SERIAL.write(inByte);
-            }
-            windowTimer = millis();
-          }
+        if (sleepTanix()) {
+          currentState = STATE_PRE_SLEEP;
+          syncTimeManager(true);
+          tanixTargetShutdownUnix = rtcBackup.now().unixtime() + (TANIX_SLEEP_DURATION / 1000UL);
+          TEST_SERIAL.println(F("Зажигание выключено. STATE_PRE_SLEEP"));
+        } else {
+          powerOffTanix();
+          currentState = STATE_SLEEP;
+          TEST_SERIAL.println(F("Зажигание выключено и Tanix не смог уснуть. STATE_SLEEP"));
         }
-        TEST_SERIAL.println(F("Зажигание выключено. STATE_PRE_SLEEP. "));
-        syncTimeManager(true);
-        currentState = STATE_PRE_SLEEP;
       }
       break;
 
     case STATE_SHUTDOWN:
-
-      // digitalWrite(PIN_ACC_OUTPUT, LOW);  // Обесточиваем магнитолу через BTS442
-      // delay(500);                         // Короткая пауза для записи кэша магнитолы
-      // currentState = STATE_SLEEP;
+      // TANIX_SERIAL.print("su -c \"echo mem > /sys/power/state\"\n");  // Отправляем Tanix команду ухода в сон через UART консоль
+      // время в Tanix
+      // uint32_t unixTime = rtcBackup.now().unixtime();
+      // // Команда date -s @<timestamp> работает в стандартном BusyBox Android/Linux
+      // TANIX_SERIAL.print(F("su -c \"date -s @"));
+      // TANIX_SERIAL.print(unixTime);
+      // TANIX_SERIAL.println(F("\""));
+      // время от Tanix
+      // TANIX_SERIAL.println(F("echo TIME:$(date +%s)")); // Отправляем Tanix команду запроса текущего Unix-времени
 
       break;
 
     case STATE_PRE_SLEEP:
-      // Спим с активным таймером (через RTC или WDT)
-      enterDeepSleep(true, TANIX_SLEEP_DURATION / 1000UL);
 
-      // Разбудил ЦЗ или зажигание
-      if (processWakeUpReason()) return;
+      uint32_t currentUnix = rtcBackup.now().unixtime();
+      uint32_t remainingSeconds = 0;
+      if (tanixTargetShutdownUnix > currentUnix) {
+        remainingSeconds = tanixTargetShutdownUnix - currentUnix;
+      }
 
+      if (remainingSeconds > 0) {
+        // Спим с активным таймером (через RTC или WDT)
+        enterDeepSleep(true, remainingSeconds);
+
+        // Разбудил ЦЗ или зажигание
+        if (processWakeUpReason()) return;
+      }
       // Сработал таймер выключения
       wokenByRtc = false;
-      TW2_SERIAL.print("\n\n");
-      delay(2000);
-      TW2_SERIAL.print("reboot -p\n");
-      delay(10000);
-      digitalWrite(PIN_ACC_OUTPUT, LOW);  // Обесточиваем приставку через BTS442
+
+      if (tryWakeUpTanix()) powerOffTanix();   // Будим и выключаем
+      else digitalWrite(PIN_ACC_OUTPUT, LOW);  // Если не проснулась всеравно выключаем питание
 
       syncTimeManager(true);
       currentState = STATE_SLEEP;  // Переходим в бесконечный сон
@@ -1363,6 +1517,7 @@ void loop() {
 //       <value name="Indicator: Battery Voltage"     offset="4" length="1" conversion="V/10"></value> <!-- Батарея -->
 //       <value name="Indicator: Temperature Inter"   offset="5" length="1" conversion="V-40"></value> <!-- Температура Салон -->
 //       <value name="Indicator: Temperature Outer"   offset="6" length="1" conversion="V-40"></value> <!-- Температура Улица -->
+//       <value name="Indicator: Temperature Board"   offset="7" length="1" conversion="V-40"></value> <!-- Температура плата МК -->
 //     </frame>
 //     <!-- Кадр 3203: Данные ГБО форсунки -->
 //     <frame id="3203">
@@ -1393,6 +1548,11 @@ void loop() {
 //     <frame id="3210">
 //       <value name="Arduino: Message" units="text"></value>
 //     </frame>
+
+//     <frame id = "0x7FF" writeinterval = "1000">
+//      <!--Привязываем к системному параметру RealDash "Device: App Active"(ID 158)или просто константе-->
+//      <value targetId = "158" offset = "0" length = "1"></ value>
+//     </ frame>
 //   </frames>
 // </RealDashCAN>
 
