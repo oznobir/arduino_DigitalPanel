@@ -83,12 +83,10 @@ const InputChannel indicators[INDICATORS_COUNT] = {
 // ==========================================================================
 
 enum SystemState {
-  STATE_STARTUP,
   STATE_PRE_SLEEP,
   STATE_SLEEP,
   STATE_PRE_DRIVE_WAKE,
-  STATE_DRIVE,
-  STATE_SHUTDOWN
+  STATE_DRIVE
 };
 
 SystemState currentState = STATE_PRE_DRIVE_WAKE;
@@ -213,7 +211,7 @@ const uint16_t FRAM_SYS_MAIN = 0x0000;
 const uint16_t FRAM_SYS_MIRROR = 0x0010;
 const uint16_t FRAM_ODO_MAIN = 0x0020;
 const uint16_t FRAM_ODO_MIRROR = 0x0030;
-const uint16_t FRAM_HISTORY_START = 0x0100;
+const uint16_t FRAM_HISTORY_START = 0x0170;
 const uint16_t FRAM_MAX_SIZE = 32768;
 const uint16_t FRAM_SIGNATURE = 0x5A;  // Уникальный ID структуры для первичной разметки
 const uint16_t MAX_HISTORY_RECORDS = (FRAM_MAX_SIZE - FRAM_HISTORY_START) / sizeof(HistoryRecord);
@@ -232,8 +230,6 @@ uint8_t tempOuterP40 = 0;
 uint8_t tempBoardP40 = 0;
 uint32_t byteIndicators = 0;
 unsigned int rpmGBO = 0;
-uint16_t remInjPetrolMs = 0;
-uint16_t remInjLpgMs = 0;
 
 // ==========================================================================
 // --- ФУНКЦИЯ ОТПРАВКИ REALDASH CAN ---
@@ -241,6 +237,7 @@ uint16_t remInjLpgMs = 0;
 
 // --- FRAME ---
 void sendRealDashFrame(unsigned long canId, const uint8_t* data8Bytes) {
+  if (!isTanixBooted) return;
   const uint8_t serialBlockHeader[4] = { 0x44, 0x33, 0x22, 0x11 };
   RD_SERIAL.write(serialBlockHeader, 4);
   RD_SERIAL.write((const uint8_t*)&canId, 4);
@@ -249,6 +246,7 @@ void sendRealDashFrame(unsigned long canId, const uint8_t* data8Bytes) {
 
 // --- TEXT ---
 void sendRealDashText(unsigned long canTextId, const char* text) {
+  if (!isTanixBooted) return;
   if (text) {
     const uint8_t serialBlockHeaderText[4] = { 0x55, 0x33, 0x22, 0x11 };
     RD_SERIAL.write(serialBlockHeaderText, 4);
@@ -287,7 +285,7 @@ uint32_t calculateCRC(uint8_t* data, size_t len) {
   return ~crc;
 }
 uint8_t calculateCRC8(const uint8_t* data, size_t length) {
-  uint8_t crc = 0xFF;
+  uint8_t crc = 0x00;
   for (size_t i = 0; i < length; i++) {
     crc ^= data[i];
     for (uint8_t j = 0; j < 8; j++) {
@@ -380,6 +378,13 @@ byte sleepPeripherals() {
   pinMode(PIN_ONE_WIRE, INPUT);
   digitalWrite(PIN_ONE_WIRE, LOW);  // Гарантированно выключаем внутренний pull-up
 
+  pinMode(PIN_ECT, INPUT);   // Для ДТОЖ
+  pinMode(PIN_FUEL, INPUT);  // Для ДУТ
+  // indicators[0].pin (зажигание) - на нем прерывание, не трогаем
+  for (int i = 1; i < INDICATORS_COUNT; i++) pinMode(indicators[i].pin, INPUT);
+  detachInterrupt(digitalPinToInterrupt(PIN_RPM));
+  detachInterrupt(digitalPinToInterrupt(PIN_SPEED));
+
   return old;
 }
 // =========================================================================
@@ -412,14 +417,40 @@ void wakeUpPeripherals(const byte old) {
   // pinMode(PIN_RX_GBO, INPUT_PULLUP);  // Подтяжка RX линии GBO_SERIAL
   sensors.begin();
   delay(5);
+  sensors.setWaitForConversion(false);
+  sensors.requestTemperatures();
+
   Wire.begin();
+  Wire.setWireTimeout(3000, true);
+
+  pinMode(PIN_ECT, INPUT_PULLUP);   // Для ДТОЖ
+  pinMode(PIN_FUEL, INPUT_PULLUP);  // Для ДУТ
+  // indicators[0].pin (зажигание) - на нем прерывание, не трогаем
+  for (int i = 1; i < INDICATORS_COUNT; i++) pinMode(indicators[i].pin, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(PIN_RPM), rpmPulseCounter, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_SPEED), speedPulseCounter, FALLING);
 }
+// =========================================================================
+// --- Функция сброса таймеров после сна ---
+// =========================================================================
+void resetTimersAfterWake() {
+  unsigned long now = millis();
+  timerFastSensors = now;
+  timerNormSensors = now;
+  timerSlowSensors = now;
+  timerGboRequest = now;
+  lastSaveTime = now;
+  lastRtcSync = now;
+}
+
 // =========================================================================
 // --- ФУНКЦИИ ОБРАБОТКИ ПРЕРЫВАНИЙ ---
 // =========================================================================
 
 // Обработчик прерывания (должен быть максимально коротким!)
 void doorTriggerISRSleep() {
+  detachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER));
   wakeUpClickCount = 1;  // Нас разбудил первый клик. Фиксируем его.
 }
 void doorTriggerISRWork() {  // Считаем следующие нажатия ЦЗ
@@ -430,6 +461,7 @@ void doorTriggerISRWork() {  // Считаем следующие нажатия
   }
 }
 void wakeUpISR() {  // Прерывание появления зажигания
+  detachInterrupt(digitalPinToInterrupt(indicators[0].pin));
   wakeUpIgnition = true;
 }
 ISR(WDT_vect) {  // Прерывание сторожевого таймера (срабатывает раз в секунду во сне)
@@ -501,7 +533,7 @@ void collectFastData(const unsigned long timeEl) {
   // rpm = (calcRPM < 0) ? 0 : (int)calcRPM;
   uint32_t numerator = (uint32_t)localRpmPulses * 30000UL;
   rpm = (numerator + ((timeEl + 1) / 2)) / timeEl;
-  if (rpm < 0) speed = 0;
+  if (rpm < 0) rpm = 0;
   // Данные для Nissan Almera G15
   // в 1 км - 6000 импульсов
   // 1 час - 3600000.0 мс, timeEl - время в мс
@@ -512,7 +544,12 @@ void collectFastData(const unsigned long timeEl) {
   if (speed < 1) speed = 0;
 
   // в 1 м - 6 импульсов (1000 м / 6000 имп)
-  uint32_t deltaMeters = (localRpmPulses + 3) / 6;
+  // uint32_t deltaMeters = (localSpeedPulses + 3) / 6;
+  static uint16_t remSpeedPulse = 0;
+  uint32_t totalPulses = localSpeedPulses + remSpeedPulse;
+  uint32_t deltaMeters = totalPulses / 6;
+  remSpeedPulse = totalPulses % 6;
+
   if (deltaMeters > 0) {
     odo.totalOdoMeters += deltaMeters;
     if (isLpgActive) {
@@ -528,7 +565,7 @@ void collectFastData(const unsigned long timeEl) {
   TEST_SERIAL.print(F(" RPM: "));
   TEST_SERIAL.print(rpm);
   TEST_SERIAL.print(F(" | SPD: "));
-  TEST_SERIAL.print(speed, 1);
+  TEST_SERIAL.print(speed);
   TEST_SERIAL.println(F(" km/h"));
   TEST_SERIAL.print(F(" LAMPS: "));
 
@@ -582,12 +619,14 @@ void collectNormData() {
   sendRealDashFrame(3206, data3206);
 
   // Кадр 3207 (Остатки)
-  // float curLpgLiters = max(0.0f, activeLpg.initialFuelLiters - ((float)activeLpg.totalInjMs * LPG_LITERS_PER_MS));
-  // float curPetrolLiters = max(0.0f, activePetrol.initialFuelLiters - ((float)activePetrol.totalInjMs * PETROL_LITERS_PER_MS));
   // 12,5 л на 100 км
-  uint16_t curLpgLitersX10 = max(0, activeLpg.remainderFuelLitersX10 + activeLpg.initialFuelLitersX10 - (uint16_t)(tripLpgKm * 125 + 50) / 100);
+  int32_t totalPetrolX10 = (int32_t)activePetrol.remainderFuelLitersX10 + activePetrol.initialFuelLitersX10;
+  int32_t spentPetrolX10 = ((int32_t)tripPetrolKm * 125 + 50) / 100;
+  uint16_t curPetrolLitersX10 = (totalPetrolX10 > spentPetrolX10) ? (uint16_t)(totalPetrolX10 - spentPetrolX10) : 0;
   // 10,5 л на 100 км
-  uint16_t curPetrolLitersX10 = max(0, activePetrol.remainderFuelLitersX10 + activePetrol.initialFuelLitersX10 - (uint16_t)(tripPetrolKm * 105 + 50) / 100);
+  int32_t totalLpgX10 = (int32_t)activeLpg.remainderFuelLitersX10 + activeLpg.initialFuelLitersX10;
+  int32_t spentLpgX10 = ((int32_t)tripLpgKm * 125 + 50) / 100;
+  uint16_t curLpgLitersX10 = (totalLpgX10 > spentLpgX10) ? (uint16_t)(totalLpgX10 - spentLpgX10) : 0;
 
   uint8_t data3207[8] = { 0 };
   memcpy(data3207, &curLpgLitersX10, 2);
@@ -657,10 +696,72 @@ void collectSlowData() {
   TEST_SERIAL.println(F("-----------------------------------"));
 }
 // =========================================================================
-// --- ФУНКЦИЯ ОТПРАВКИ ДАННЫХ ПО ПОЗДКАМ ПОСЛЕ СНА В REALDASH ---
+// --- ФУНКЦИЯ ОТПРАВКИ ДАННЫХ ПО ПОЗДКАМ В REALDASH ---
+//  отбирает последние N валидных записей (от самых свежих записей к старым)
 // =========================================================================
-void sendTripsDataAfterWakeUp() {
+void sendHistoryToRealDash(uint8_t maxLinesToSend = 5) {
+  if (!isTanixBooted) return;
+  char lineBuf[72];  // Статический буфер для форматирования одной строки
+  uint8_t sentCount = 0;
+  int16_t index = header.nextFreeIndex - 1;  // Начинаем с индекса перед nextFreeIndex
+  if (index < 0) index = MAX_HISTORY_RECORDS - 1;
+  // Проходим по кольцевому буферу назад (не более MAX_HISTORY_RECORDS шагов)
+  for (uint16_t step = 0; step < MAX_HISTORY_RECORDS && sentCount < maxLinesToSend; step++) {
+    uint16_t addr = FRAM_HISTORY_START + (index * sizeof(HistoryRecord));
+    HistoryRecord rec;
+    fram.read(addr, (uint8_t*)&rec, sizeof(rec));
+    // Проверяем контрольную сумму и что запись не пустая и не битая (status != 2)
+    bool crcOk = (calculateCRC8((uint8_t*)&rec, sizeof(rec) - 1) == rec.crc);
+    if (crcOk && rec.startTime > 0 && (rec.fuelType == 1 || rec.fuelType == 2) && rec.status != 2) {
+      // Конвертируем Unix-время начала сессии в дату
+      DateTime dt(rec.startTime);
+      // Переводим литры (X10) и метры в удобные единицы
+      uint16_t remainderLitWhole1 = rec.remainderFuelLitersX10 / 10;
+      uint8_t remainderLitFrac1 = rec.remainderFuelLitersX10 % 10;
+
+      uint16_t initialLitWhole = rec.initialFuelLitersX10 / 10;
+      uint8_t initialLitFrac = rec.initialFuelLitersX10 % 10;
+
+      uint32_t distKm = (rec.distanceMeters + 500) / 1000;
+
+      int32_t spentX10 = (rec.fuelType == 2) ? (distKm * 125 + 50) / 100 : (distKm * 105 + 50) / 100;
+      uint16_t spentLitWhole = spentX10 / 10;
+      uint8_t spentLitFrac = spentX10 % 10;
+
+      int32_t totalX10 = (int32_t)rec.remainderFuelLitersX10 + rec.initialFuelLitersX10;
+      uint16_t remainderLitWhole2 = (totalX10 > spentX10) ? ((uint16_t)(totalX10 - spentX10)) / 10 : 0;
+      uint8_t remainderLitFrac2 = (totalX10 > spentX10) ? ((uint16_t)(totalX10 - spentX10)) % 10 : 0;
+
+      const char* fuelStr = (rec.fuelType == 2) ? "ГАЗ   " : "БЕНЗИН";
+      const char* stateMark = (rec.status == 0) ? "*" : " ";  // Звездочка для текущей активной сессии
+      snprintf(lineBuf, sizeof(lineBuf), "| %4u%s | %s | %02d.%02d.%02d | %4lu | %3u.%u | %3u.%u | %3u.%u | %3u.%u |",
+               index, stateMark, fuelStr,
+               dt.day(), dt.month(), dt.year() % 100,
+               distKm,
+               remainderLitWhole1, remainderLitFrac1,
+               initialLitWhole, initialLitFrac,
+               spentLitWhole, spentLitFrac,
+               remainderLitWhole2, remainderLitFrac2);
+
+      // Отправляем в текстовый ID: 3300, 3301, 3302...
+      sendRealDashText(3300 + sentCount, lineBuf);
+      sentCount++;
+
+      delay(15);  // Короткая пауза, чтобы не переполнить приемный буфер
+    }
+
+    // Шагаем на одну запись назад по кольцу
+    index--;
+    if (index < 0) index = MAX_HISTORY_RECORDS - 1;
+  }
+
+  // Если в истории записей меньше, чем строк на экране — очищаем оставшиеся виджеты
+  while (sentCount < maxLinesToSend) {
+    sendRealDashText(3300 + sentCount, " --- ");
+    sentCount++;
+  }
 }
+
 // =========================================================================
 // --- ФУНКЦИЯ НЕБЛОКИРУЮЩЕГО ЧТЕНИЯ ДАННЫХ ОТ ЭБУ ГБО ---
 // =========================================================================
@@ -707,20 +808,23 @@ void parseGboBuffer() {
 
   isLpgActive = (rpmGBO > 400 && sumInjLpgX10 > 8) ? true : false;  // Едем на бензине (или мотор заглох)
 
+  static uint32_t remInjPetrolMs = 0;
   if (!isLpgActive && sumInjPetrolX10 > 0) {
     uint64_t numeratorPetrolX10 = (uint64_t)sumInjPetrolX10 * rpmGBO * deltaTimeGboMs;
     remInjPetrolMs += (numeratorPetrolX10 + 600000ULL) / 1200000ULL;
-    while (remInjPetrolMs >= 1000) {
-      activePetrol.totalInjSeconds++;
-      remInjPetrolMs -= 1000;
+    if (remInjPetrolMs >= 1000) {
+      activePetrol.totalInjSeconds += remInjPetrolMs / 1000;
+      remInjPetrolMs %= 1000;
     }
   }
+
+  static uint32_t remInjLpgMs = 0;
   if (isLpgActive && sumInjLpgX10 > 0) {
     uint64_t numeratorLpgX10 = (uint64_t)sumInjLpgX10 * rpmGBO * deltaTimeGboMs;
     remInjLpgMs += (numeratorLpgX10 + 600000ULL) / 1200000ULL;
-    while (remInjLpgMs >= 1000) {
-      activeLpg.totalInjSeconds++;
-      remInjLpgMs -= 1000;
+    if (remInjLpgMs >= 1000) {
+      activeLpg.totalInjSeconds += remInjLpgMs / 1000;
+      remInjLpgMs %= 1000;
     }
   }
   // --- Кадр 3203 (Все форсунки: 4 бензин + 4 газ) ---
@@ -785,37 +889,22 @@ void checkIncomingRealDashCAN() {
         uint16_t fuelRemainder;
         uint16_t fuelAmount;
         memcpy(&fuelRemainder, &rdRxBuffer[2], 2);
-        memcpy(&fuelAmount, &rdRxBuffer[3], 2);
+        memcpy(&fuelAmount, &rdRxBuffer[4], 2);
 
         if (command == 1) handleRefuelCommand(fuelType, fuelRemainder, fuelAmount);
       }
+      if (canId == 3222) {         // Запрос истории заправок от кнопки в RealDash
+        sendHistoryToRealDash(5);  // Выгружаем 5 последних записей (в ID 3300..3304)
+      }
     }
   }
-  // if (Serial.available() >= 16) {
-  //   if (Serial.read() == 0x44 && Serial.read() == 0x33 && Serial.read() == 0x22 && Serial.read() == 0x11) {
-  //     uint32_t canId;
-  //     Serial.readBytes((char*)&canId, 4);
-  //     uint8_t frameData[8];
-  //     Serial.readBytes((char*)frameData, 8);
-
-  //     if (canId == 0x300) {               // данные по поездкам
-  //       uint8_t fuelType = frameData[0];  // 1 - Бензин, 2 - Газ
-  //       uint8_t command = frameData[1];   // 1 - Новая заправка, 2 - Изменение данных текущей поездки
-  //       uint16_t fuelRemainder;
-  //       uint16_t fuelAmount;
-  //       memcpy(&fuelRemainder, &frameData[2], 2);
-  //       memcpy(&fuelAmount, &frameData[3], 2);
-
-  //       if (command == 1) handleRefuelCommand(fuelType, fuelRemainder, fuelAmount);
-  //     }
-  //   }
-  // }
 }
 // =========================================================================
 // --- Функция обработки команды (1) закрытия текущей и открытия новой  ---
 // --- поездки при заправке топлива                                     ---
 // =========================================================================
 void handleRefuelCommand(uint8_t fuelType, uint16_t fuelRemainder, uint16_t fuelAmount) {
+  if (fuelType != 1 && fuelType != 2) return;
   if (fuelType == 2) {
     activeLpg.status = 1;  // Закрыта
     activeLpg.endTime = rtcBackup.now().unixtime();
@@ -845,6 +934,8 @@ void handleRefuelCommand(uint8_t fuelType, uint16_t fuelRemainder, uint16_t fuel
   header.crc = calculateCRC8((uint8_t*)&header, sizeof(header) - 1);
   fram.write(FRAM_SYS_MAIN, (uint8_t*)&header, sizeof(header));
   fram.write(FRAM_SYS_MIRROR, (uint8_t*)&header, sizeof(header));
+
+  backupDataToFram();
 }
 // =========================================================================
 // --- Функция синхронизация времени с RTC-часами ---
@@ -936,7 +1027,7 @@ void systemMemoryInitAndValidate() {
 // =========================================================================
 void validateActiveSession(uint8_t fuelType) {
   uint16_t currentIndex = (fuelType == 2) ? header.currentLpgIndex : header.currentPetrolIndex;
-  uint32_t addr = FRAM_HISTORY_START + (currentIndex * sizeof(HistoryRecord));
+  uint16_t addr = FRAM_HISTORY_START + (currentIndex * sizeof(HistoryRecord));
 
   HistoryRecord tempRecord;
   fram.read(addr, (uint8_t*)&tempRecord, sizeof(tempRecord));
@@ -963,7 +1054,11 @@ void validateActiveSession(uint8_t fuelType) {
     active->fuelType = fuelType;
     active->remainderFuelLitersX10 = 0;
     active->initialFuelLitersX10 = 0;  //= (fuelType == 2) ? 40.0f : 50.0f;
-    triggerRealDashAlert(1);           // Предупреждение: Сессия сброшена помехой
+    active->crc = calculateCRC8((uint8_t*)active, sizeof(HistoryRecord) - 1);
+    uint16_t newAddr = FRAM_HISTORY_START + (newIndex * sizeof(HistoryRecord));
+    fram.write(newAddr, (uint8_t*)active, sizeof(HistoryRecord));
+
+    triggerRealDashAlert(1);  // Предупреждение: Сессия сброшена помехой
   } else {
     if (fuelType == 2) activeLpg = tempRecord;
     else activePetrol = tempRecord;
@@ -1060,8 +1155,8 @@ void enterDeepSleep(bool useAlarm, uint32_t maxSeconds) {
   }
 
   // Отключаем внешние прерывания сна и поднимаем периферию (включая I2C!)
-  detachInterrupt(digitalPinToInterrupt(indicators[0].pin));
-  detachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER));
+  // detachInterrupt(digitalPinToInterrupt(indicators[0].pin)); // перенесено в функцию-обработчика прерывания
+  // detachInterrupt(digitalPinToInterrupt(PIN_DOOR_TRIGGER));  // перенесено в функцию-обработчика прерывания
   PCICR &= ~(1 << PCIE2);
 
   wakeUpPeripherals(old_ADCSRA);
@@ -1071,6 +1166,8 @@ void enterDeepSleep(bool useAlarm, uint32_t maxSeconds) {
     rtc.disableAlarm(1);
     rtc.clearAlarm(1);
   }
+  syncTimeManager(true);
+  resetTimersAfterWake();
 }
 // =========================================================================
 // ФУНКЦИЯ АНАЛИЗА ПРИЧИНЫ ПРОБУЖДЕНИЯ
@@ -1109,6 +1206,7 @@ bool processWakeUpReason() {
     TEST_SERIAL.println(currentClicks);
     TEST_SERIAL.flush();
 
+    syncTimeManager(true);
     if (currentClicks == 1) {      // 1 КЛИК = Точно едем!
       if (ensureTanixPowerOn()) {  // Проверяем АКБ и запускаем приставку
         currentState = STATE_PRE_DRIVE_WAKE;
@@ -1118,10 +1216,9 @@ bool processWakeUpReason() {
         currentState = STATE_SLEEP;  // Переходим в бесконечный сон
       }
     } else {
-      // Если 2 клика (закрыли) или больше — идем спать в бесконечный сон
-      // (если приставка еще была в mem, остаемся в PRE_SLEEP или в SLEEP)
-      TEST_SERIAL.println(F("Кликов больше 1. Возврат в сон..."));
+      // Если 2 клика или больше — идем спать (остаемся в PRE_SLEEP или в SLEEP)
       syncTimeManager(true);
+      TEST_SERIAL.println(F("Кликов 2 и больше. Возврат в сон..."));
     }
     return true;
   }
@@ -1144,7 +1241,6 @@ bool processWakeUpReason() {
 bool ensureTanixPowerOn() {
   if (digitalRead(PIN_ACC_OUTPUT) == HIGH) {  // Проверяем, не включено ли уже питание
     TEST_SERIAL.println(F("Питание приставки уже подано. Будим по UART..."));
-    // if (currentState == STATE_PRE_SLEEP) TANIX_SERIAL.print("\n\n");  // Короткий импульс в консоль выводит Android из сна "mem"
     if (!tryWakeUpTanix()) {  // Консоль не отвечает - значит зависла
       digitalWrite(PIN_ACC_OUTPUT, LOW);
       delay(500);
@@ -1177,7 +1273,10 @@ bool tryWakeUpTanix() {
     TANIX_SERIAL.print("\n\n");
     unsigned long start = millis();
     while (millis() - start < 1500) {
-      if (TANIX_SERIAL.available()) return true;  // Успешно проснулась!
+      if (TANIX_SERIAL.available()) {
+        delay(500);   // Ждем весь лог пробуждения
+        return true;  // Успешно проснулась!
+      }
     }
   }
   return false;  // За 3 попытки не ответила
@@ -1211,7 +1310,7 @@ bool readUartTanixLine(unsigned long timeoutMs) {
       TEST_SERIAL.write(c);  // Дублируем весь поток в монитор порта ПК для отладки
       if (c == '\n') {
         uartTanixBuffer[uartTanixIndex] = '\0';  // Завершаем C-строку
-        TEST_SERIAL.write(uartTanixBuffer, sizeof(uartTanixBuffer));
+        // TEST_SERIAL.write(uartTanixBuffer);
         uartTanixIndex = 0;
         return true;  // Собрана целая строка
       } else if (c != '\r') {
@@ -1262,7 +1361,17 @@ bool sleepTanix() {
   // Тут, видимо, нужно перегрузить приставку?
   return false;
 }
-
+// =========================================================================
+// --- Функция рассчитывает оставщееся время сна приставки ---
+// =========================================================================
+uint32_t getRemainingSeconds() {
+  uint32_t currentUnix = rtcBackup.now().unixtime();
+  uint32_t remainingSeconds = 0;
+  if (tanixTargetShutdownUnix > currentUnix) {
+    remainingSeconds = tanixTargetShutdownUnix - currentUnix;
+  }
+  return remainingSeconds;
+}
 // =========================================================================
 // --- Тестовая функция проверки чтения-записи данных в память ---
 // =========================================================================
@@ -1380,102 +1489,80 @@ void loop() {
   // =========================================================================
   // --- АВТОМАТ СОСТОЯНИЙ ПИТАНИЯ ---
   // =========================================================================
-
-
   bool isIgnitionOn = (digitalRead(indicators[0].pin) == LOW);
-
   switch (currentState) {
-
     case STATE_PRE_DRIVE_WAKE:
+      {
+        collectData();
+        // Ждем зажигания в течение минут
+        if (isIgnitionOn) {
+          currentState = STATE_DRIVE;
+          TEST_SERIAL.println(F("Состояние изменено на DRIVE."));
 
-      collectData();
-      // Ждем зажигания в течение минут
-      if (isIgnitionOn) {
-        currentState = STATE_DRIVE;
-        TEST_SERIAL.println(F("Состояние изменено на DRIVE."));
-
-      } else if (millis() - wakeUpTimerStart >= TIMEOUT_WAIT_IGNITION) {
-        backupDataToFram();
-        // TANIX_SERIAL.print("su -c \"echo mem > /sys/power/state\"\n");  // Отправляем Tanix команду ухода в сон через UART консоль
-        if (sleepTanix()) {
-          currentState = STATE_PRE_SLEEP;
-          syncTimeManager(true);
-          tanixTargetShutdownUnix = rtcBackup.now().unixtime() + (TANIX_SLEEP_DURATION / 1000UL);
-          TEST_SERIAL.println(F("Вышло время. STATE_PRE_SLEEP"));
-        } else {
-          powerOffTanix();
-          currentState = STATE_SLEEP;
-          TEST_SERIAL.println(F("Вышло время и Tanix не смог уснуть. STATE_SLEEP"));
+        } else if (millis() - wakeUpTimerStart >= TIMEOUT_WAIT_IGNITION) {
+          backupDataToFram();
+          // TANIX_SERIAL.print("su -c \"echo mem > /sys/power/state\"\n");  // Отправляем Tanix команду ухода в сон через UART консоль
+          if (sleepTanix()) {
+            currentState = STATE_PRE_SLEEP;
+            syncTimeManager(true);
+            tanixTargetShutdownUnix = rtcBackup.now().unixtime() + (TANIX_SLEEP_DURATION / 1000UL);
+            TEST_SERIAL.println(F("Вышло время. STATE_PRE_SLEEP"));
+          } else {
+            powerOffTanix();
+            syncTimeManager(true);
+            currentState = STATE_SLEEP;
+            TEST_SERIAL.println(F("Вышло время и Tanix не смог уснуть. STATE_SLEEP"));
+          }
         }
+        break;
       }
-
-      break;
-
     case STATE_DRIVE:
-
-      collectData(true);
-      // В режиме поездки смотрим только на зажигание.
-      if (!isIgnitionOn) {
-        backupDataToFram();
-        if (sleepTanix()) {
-          currentState = STATE_PRE_SLEEP;
-          syncTimeManager(true);
-          tanixTargetShutdownUnix = rtcBackup.now().unixtime() + (TANIX_SLEEP_DURATION / 1000UL);
-          TEST_SERIAL.println(F("Зажигание выключено. STATE_PRE_SLEEP"));
-        } else {
-          powerOffTanix();
-          currentState = STATE_SLEEP;
-          TEST_SERIAL.println(F("Зажигание выключено и Tanix не смог уснуть. STATE_SLEEP"));
+      {
+        collectData(true);
+        // В режиме поездки смотрим только на зажигание.
+        if (!isIgnitionOn) {
+          backupDataToFram();
+          if (sleepTanix()) {
+            currentState = STATE_PRE_SLEEP;
+            syncTimeManager(true);
+            tanixTargetShutdownUnix = rtcBackup.now().unixtime() + (TANIX_SLEEP_DURATION / 1000UL);
+            TEST_SERIAL.println(F("Зажигание выключено. STATE_PRE_SLEEP"));
+          } else {
+            powerOffTanix();
+            currentState = STATE_SLEEP;
+            TEST_SERIAL.println(F("Зажигание выключено и Tanix не смог уснуть. STATE_SLEEP"));
+          }
         }
+        break;
       }
-      break;
-
-    case STATE_SHUTDOWN:
-      // TANIX_SERIAL.print("su -c \"echo mem > /sys/power/state\"\n");  // Отправляем Tanix команду ухода в сон через UART консоль
-      // время в Tanix
-      // uint32_t unixTime = rtcBackup.now().unixtime();
-      // // Команда date -s @<timestamp> работает в стандартном BusyBox Android/Linux
-      // TANIX_SERIAL.print(F("su -c \"date -s @"));
-      // TANIX_SERIAL.print(unixTime);
-      // TANIX_SERIAL.println(F("\""));
-      // время от Tanix
-      // TANIX_SERIAL.println(F("echo TIME:$(date +%s)")); // Отправляем Tanix команду запроса текущего Unix-времени
-
-      break;
-
     case STATE_PRE_SLEEP:
+      {
+        uint32_t remainingSeconds = getRemainingSeconds();
+        if (remainingSeconds > 0) {
+          // Спим с активным таймером (через RTC или WDT)
+          enterDeepSleep(true, remainingSeconds);
 
-      uint32_t currentUnix = rtcBackup.now().unixtime();
-      uint32_t remainingSeconds = 0;
-      if (tanixTargetShutdownUnix > currentUnix) {
-        remainingSeconds = tanixTargetShutdownUnix - currentUnix;
+          // Разбудил ЦЗ или зажигание
+          if (processWakeUpReason()) return;
+        }
+        // Сработал таймер выключения
+        wokenByRtc = false;
+
+        if (tryWakeUpTanix()) powerOffTanix();   // Будим и выключаем
+        else digitalWrite(PIN_ACC_OUTPUT, LOW);  // Если не проснулась всеравно выключаем питание
+        syncTimeManager(true);
+        currentState = STATE_SLEEP;  // Переходим в бесконечный сон
+
+        break;
       }
-
-      if (remainingSeconds > 0) {
-        // Спим с активным таймером (через RTC или WDT)
-        enterDeepSleep(true, remainingSeconds);
-
-        // Разбудил ЦЗ или зажигание
-        if (processWakeUpReason()) return;
-      }
-      // Сработал таймер выключения
-      wokenByRtc = false;
-
-      if (tryWakeUpTanix()) powerOffTanix();   // Будим и выключаем
-      else digitalWrite(PIN_ACC_OUTPUT, LOW);  // Если не проснулась всеравно выключаем питание
-
-      syncTimeManager(true);
-      currentState = STATE_SLEEP;  // Переходим в бесконечный сон
-
-      break;
-
     case STATE_SLEEP:
-      // Бесконечный сон (без будильника; если RTC отвалился, WDT тикает для хода софт-часов)
-      enterDeepSleep(false, 0);
-      // Анализируем, кто разбудил (1 клик ЦЗ -> PRE_DRIVE_WAKE, зажигание -> DRIVE)
-      processWakeUpReason();
-
-      break;
+      {
+        // Бесконечный сон (без будильника; если RTC отвалился, WDT тикает для хода софт-часов)
+        enterDeepSleep(false, 0);
+        // Анализируем, кто разбудил (1 клик ЦЗ -> PRE_DRIVE_WAKE, зажигание -> DRIVE)
+        processWakeUpReason();
+        break;
+      }
   }
 }
 // <?xml version="1.0" encoding="utf-8"?>
@@ -1545,14 +1632,45 @@ void loop() {
 //       <value name="ГБО: Нагрузка двигателя" offset="6" length="1" conversion="V" units="%"></value>
 //     </frame>
 
-//     <frame id="3210">
-//       <value name="Arduino: Message" units="text"></value>
+//     <frame id="3211">
+//       <value name="Arduino: Ошибки" offset="0" length="1"></value>
 //     </frame>
 
-//     <frame id = "0x7FF" writeinterval = "1000">
+//     <!-- Текстовые строки истории заправок (ID 3300..3304) -->
+//     <frame id="3300">
+//       <value name="История заправок 1" units="text"></value>
+//     </frame>
+//     <frame id="3301">
+//       <value name="История заправок 2" units="text"></value>
+//     </frame>
+//     <frame id="3302">
+//      <value name="История заправок 3" units="text"></value>
+//     </frame>
+//      <frame id="3303">
+//     <value name="История заправок 4" units="text"></value>
+//      </frame>
+//     <frame id="3304">
+//      <value name="История заправок 5" units="text"></value>
+//     </frame>
+
+// <!-- Отправляется из RealDash в Arduino -->
+//    <!-- Сообщение, что Tanix RealDash загрузились (отправляется из RealDash в Arduino) -->
+//     <frame id = "3220" writeinterval = "1000">
 //      <!--Привязываем к системному параметру RealDash "Device: App Active"(ID 158)или просто константе-->
 //      <value targetId = "158" offset = "0" length = "1"></ value>
 //     </ frame>
+//    <!-- Сообщение о новой заправке (поездке) (отправляется из RealDash в Arduino) -->
+//     <frame id="3221">
+//       <value targetId = "000" name = "Fuel Type"  offset="0" length="1"></value>
+//       <value targetId = "000" name = "Fuel command"  offset="1" length="1"></value>
+//       <value targetId = "000" name = "Fuel Remainder"  offset="2" length="2"></value>
+//       <value targetId = "000" name = "Fuel Amount"  offset="4" length="2"></value>
+
+//     </frame>
+//     <!-- Кнопка запроса истории (отправляется из RealDash в Arduino) -->
+//     <frame id="3222">
+//       <value targetId = "000" name="Запрос истории" offset="0" length="1"></value>
+//     </frame>
 //   </frames>
 // </RealDashCAN>
 
